@@ -4,17 +4,21 @@ extract.py — Pull raw band/pixel values from satellite sources at point locati
 How it works:
   1. You provide a CSV/DataFrame with Latitude, Longitude (your sample points)
   2. We download the satellite raster for your bbox + date range
-  3. We use .sel(method="nearest") to grab the pixel value at each of YOUR points
+  3. For each point, we extract pixel values using one of two methods:
+     - neighborhood=0 (default): single nearest pixel via .sel(method="nearest")
+     - neighborhood=N: NxN pixel bounding box median around each point
+       (Chase Kusterer's approach — better represents the area around each station)
   4. Output DataFrame has exactly the same number of rows as your input CSV
 
 Data quality:
+  - Sentinel-2 uses SCL band to mask clouds, shadows, snow, water before compositing
   - Nodata pixels (0 in Sentinel, 0 in Landsat) are replaced with NaN
   - Landsat thermal is properly scaled: DN → Kelvin → °C, with nodata masked first
-  - Sentinel compositing (median) naturally reduces cloud contamination
+  - Sentinel compositing (median over time + SCL masking) gives clean cloud-free data
 
 Cache rules:
   - DEM + Buildings: keyed by (bbox, points) → immune to date/resolution changes
-  - Sentinel + Landsat: keyed by (bbox, points, date, resolution) → re-run when these change
+  - Sentinel + Landsat: keyed by (bbox, points, date, resolution, neighborhood)
 """
 
 import pandas as pd
@@ -87,6 +91,49 @@ SENTINEL_BANDS = [
     "B07", "B08", "B8A", "B11", "B12",
 ]
 
+# SCL values to EXCLUDE (clouds, shadows, snow, nodata, saturated)
+SCL_BAD = {0, 1, 3, 8, 9, 10}
+
+
+def _extract_at_points(comp, bands, pts_df, neighborhood, scale):
+    """
+    Extract band values at point locations from a composited raster.
+
+    neighborhood=0  → nearest pixel (.sel method="nearest")
+    neighborhood=N  → NxN pixel bounding box median around each point
+                      (Chase Kusterer's approach: captures spatial context)
+    """
+    lats = pts_df["Latitude"].values
+    lons = pts_df["Longitude"].values
+
+    df = pd.DataFrame({"Latitude": lats, "Longitude": lons})
+
+    if neighborhood <= 0:
+        # single nearest pixel
+        lat_da = xr.DataArray(lats, dims="points")
+        lon_da = xr.DataArray(lons, dims="points")
+        for band in bands:
+            df[band] = comp[band].sel(
+                longitude=lon_da, latitude=lat_da, method="nearest"
+            ).values.astype(float)
+    else:
+        # NxN bounding box median (half-window = N/2 pixels)
+        half_pixels = neighborhood / 2
+        lon_offset = scale * half_pixels
+        lat_offset = scale * half_pixels
+
+        for band in bands:
+            vals = []
+            for lat, lon in zip(lats, lons):
+                subset = comp[band].sel(
+                    longitude=slice(lon - lon_offset, lon + lon_offset),
+                    latitude=slice(lat + lat_offset, lat - lat_offset),
+                )
+                vals.append(float(np.nanmedian(subset.values)))
+            df[band] = vals
+
+    return df
+
 
 def extract_sentinel(
     pts_df,
@@ -96,6 +143,7 @@ def extract_sentinel(
     bands=None,
     max_cloud=30,
     composite="median",
+    neighborhood=0,
     use_cache=True,
     cache_dir=DEFAULT_CACHE_DIR,
 ):
@@ -104,28 +152,25 @@ def extract_sentinel(
 
     Steps:
       1. Search Planetary Computer for scenes in bbox + date range
-      2. Load all scenes into xarray (chunked, lazy)
-      3. Mask nodata (raw DN=0 → NaN) so compositing ignores bad pixels
-      4. Compute median composite across all scenes → one clean raster
-      5. Extract the nearest pixel value at each (lat, lon) from your CSV
-
-    Output: DataFrame with same row count as pts_df.
-    Columns: Latitude, Longitude, B01, B02, ..., B12
+      2. Load all scenes + SCL cloud mask into xarray
+      3. Apply SCL mask: remove clouds, shadows, snow, water, nodata
+      4. Mask remaining nodata (DN=0 → NaN)
+      5. Compute median composite across time
+      6. Extract values at each point (nearest pixel or NxN neighborhood median)
 
     Parameters
     ----------
-    pts_df : DataFrame with Latitude, Longitude columns
-    bbox : (south, west, north, east) in degrees
-    time_window : "2024-01-15/2024-02-15"
-    resolution : pixel size in meters (10–1000)
-    max_cloud : max cloud cover % for scene filtering
-    composite : "median" or "mean"
+    neighborhood : int
+        0 = nearest pixel (fast, default)
+        100 = 100×100 pixel bounding box median around each point
+              (Chase Kusterer's approach — better for UHI station data)
     """
     bands = bands or SENTINEL_BANDS
 
     cache_params = dict(
         bbox=bbox, time_window=time_window,
         resolution=resolution, pid=points_fingerprint(pts_df),
+        neighborhood=neighborhood,
     )
     if use_cache:
         cached = cache_get("sentinel", cache_dir, **cache_params)
@@ -147,37 +192,35 @@ def extract_sentinel(
     if not items:
         return None
 
-    # load all scenes (lazy via dask chunks)
+    # load spectral bands + SCL cloud classification band
+    load_bands = bands + ["SCL"]
     data = stac_load(
-        items, bands=bands, crs="EPSG:4326", resolution=scale,
+        items, bands=load_bands, crs="EPSG:4326", resolution=scale,
         chunks={"x": 2048, "y": 2048}, dtype="uint16",
         patch_url=planetary_computer.sign, bbox=stac_bbox,
     )
 
-    # mask nodata: Sentinel-2 L2A uses 0 as nodata/fill value
-    # without this, 0-pixels contaminate the median and produce bad indices
-    data = data.where(data > 0)
+    # SCL cloud mask: exclude nodata(0), saturated(1), shadow(3),
+    # cloud-medium(8), cloud-high(9), cirrus(10)
+    scl = data["SCL"]
+    cloud_mask = scl.copy(data=np.ones_like(scl.values, dtype=bool))
+    for bad_val in SCL_BAD:
+        cloud_mask = cloud_mask & (scl != bad_val)
 
-    # composite collapses multiple scenes into one raster
-    # median is robust to outliers (clouds that slipped past the filter)
-    comp = getattr(data, composite)(dim="time").compute()
+    # apply SCL mask to spectral bands (keeps only clear pixels)
+    data_clean = data[bands].where(cloud_mask)
 
-    # extract pixel values at each point
-    lats = xr.DataArray(pts_df["Latitude"].values, dims="points")
-    lons = xr.DataArray(pts_df["Longitude"].values, dims="points")
+    # also mask raw nodata (DN=0 can still exist in non-masked areas)
+    data_clean = data_clean.where(data_clean > 0)
 
-    df = pd.DataFrame({
-        "Latitude": pts_df["Latitude"].values,
-        "Longitude": pts_df["Longitude"].values,
-    })
-    for band in bands:
-        df[band] = comp[band].sel(
-            longitude=lons, latitude=lats, method="nearest"
-        ).values.astype(float)
+    # composite: median across time collapses to one clean raster
+    comp = getattr(data_clean, composite)(dim="time").compute()
 
-    del data, comp
+    # extract at points
+    df = _extract_at_points(comp, bands, pts_df, neighborhood, scale)
 
-    # report how many points got valid data
+    del data, data_clean, comp
+
     valid = df[bands].notna().all(axis=1).sum()
     print(f"[Sentinel-2] {len(df)} points × {len(bands)} bands ({valid} valid, {len(df)-valid} have NaN)")
     if use_cache:
@@ -206,6 +249,7 @@ def extract_landsat(
     resolution=250,
     max_cloud=50,
     scene_index=0,
+    neighborhood=0,
     use_cache=True,
     cache_dir=DEFAULT_CACHE_DIR,
 ):
@@ -215,19 +259,23 @@ def extract_landsat(
     Single scene (not composite) because LST from different dates can't be
     meaningfully averaged — each scene captures a specific thermal snapshot.
 
-    Data quality fix for lwir11:
-      - Raw DN=0 is nodata (fill value outside scene footprint or under clouds)
-      - We mask these BEFORE applying scale factors
-      - Without this: 0 * 0.00341802 + 149.0 - 273.15 = -124°C (garbage)
-      - With mask: those pixels become NaN instead
+    Data quality:
+      - DN=0 masked BEFORE scale factors (prevents -124°C garbage)
+      - vis: DN → surface reflectance (0–0.5 range)
+      - lwir11: DN → brightness temperature in °C
 
-    Output: Latitude, Longitude, red, green, blue, nir08, lwir11
-      - vis bands: surface reflectance (0–1 range)
-      - lwir11: brightness temperature in °C (typical range 15–50°C for urban)
+    Parameters
+    ----------
+    neighborhood : int
+        0 = nearest pixel (fast, default)
+        100 = 100×100 pixel bounding box median around each point
     """
+    all_bands = LANDSAT_VIS_BANDS + LANDSAT_THERMAL
+
     cache_params = dict(
         bbox=bbox, time_window=time_window,
         resolution=resolution, pid=points_fingerprint(pts_df),
+        neighborhood=neighborhood,
     )
     if use_cache:
         cached = cache_get("landsat", cache_dir, **cache_params)
@@ -262,48 +310,31 @@ def extract_landsat(
     )
 
     # MASK NODATA BEFORE scaling
-    # Landsat C2L2 uses 0 as fill/nodata for pixels outside scene or under clouds
-    # Without masking: 0 * scale + offset = garbage values (-124°C for thermal)
     data_vis = data_vis.where(data_vis > 0)
     data_therm = data_therm.where(data_therm > 0)
 
-    # apply Landsat C2L2 scale factors to valid pixels only
-    # vis: DN → surface reflectance (0 to ~0.5 range)
-    # thermal: DN → brightness temperature in °C
-    #
-    # IMPORTANT: lwir11 output is BRIGHTNESS TEMPERATURE, not Land Surface Temperature.
-    # BT is what the satellite sensor measures. To get actual LST you need an
-    # emissivity correction (done in features.py landsat_features()).
-    # Do NOT apply the DN→°C conversion again downstream — it's done here once.
+    # apply Landsat C2L2 scale factors
+    # IMPORTANT: lwir11 output is BRIGHTNESS TEMPERATURE, not LST.
+    # Emissivity correction → LST is done in features.py
     data_vis = data_vis.astype(float) * LANDSAT_VIS_SCALE + LANDSAT_VIS_OFFSET
     data_therm = data_therm.astype(float) * LANDSAT_THERM_SCALE + LANDSAT_THERM_OFFSET - 273.15
 
-    # pick a single scene
+    # pick single scene (sorted by cloud cover in search)
     d_vis = data_vis.isel(time=scene_index).compute()
     d_therm = data_therm.isel(time=scene_index).compute()
 
-    # extract at points
-    lats = xr.DataArray(pts_df["Latitude"].values, dims="points")
-    lons = xr.DataArray(pts_df["Longitude"].values, dims="points")
+    # merge vis + thermal into one dataset for unified extraction
+    combined = xr.merge([d_vis, d_therm])
 
-    df = pd.DataFrame({
-        "Latitude": pts_df["Latitude"].values,
-        "Longitude": pts_df["Longitude"].values,
-    })
-    for band in LANDSAT_VIS_BANDS:
-        df[band] = d_vis[band].sel(
-            latitude=lats, longitude=lons, method="nearest"
-        ).values.astype(float)
-    df["lwir11"] = d_therm["lwir11"].sel(
-        latitude=lats, longitude=lons, method="nearest"
-    ).values.astype(float)
+    # extract at points using shared function
+    df = _extract_at_points(combined, all_bands, pts_df, neighborhood, scale)
 
-    del data_vis, data_therm, d_vis, d_therm
+    del data_vis, data_therm, d_vis, d_therm, combined
 
     # report quality
     valid_thermal = df["lwir11"].notna().sum()
     bad_thermal = ((df["lwir11"] < -50) | (df["lwir11"] > 80)).sum()
-    print(f"[Landsat] {len(df)} points × {len(LANDSAT_VIS_BANDS)+1} bands")
+    print(f"[Landsat] {len(df)} points × {len(all_bands)} bands")
     print(f"[Landsat] lwir11: {valid_thermal} valid, {bad_thermal} out-of-range (< -50 or > 80°C)")
 
     if use_cache:
