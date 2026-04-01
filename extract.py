@@ -241,6 +241,32 @@ LANDSAT_VIS_OFFSET = -0.2
 LANDSAT_THERM_SCALE = 0.00341802
 LANDSAT_THERM_OFFSET = 149.0  # converts to Kelvin
 
+# QA_PIXEL bit flags for Landsat Collection 2 Level 2
+# Bit 1 = dilated cloud, Bit 3 = cloud, Bit 4 = cloud shadow, Bit 5 = snow
+# We mask any pixel where ANY of these bits are set.
+QA_CLOUD_BITS = [1, 3, 4, 5]
+
+
+def _qa_cloud_mask(qa_band):
+    """
+    Build a boolean mask from Landsat QA_PIXEL band.
+
+    Returns True for CLEAR pixels, False for cloud/shadow/snow.
+    Same role as Sentinel's SCL mask — removes contaminated pixels
+    before compositing so clouds don't leak into the median.
+
+    Bit reference (USGS Landsat C2 L2 QA_PIXEL):
+      Bit 0: fill          Bit 1: dilated cloud
+      Bit 2: cirrus        Bit 3: cloud
+      Bit 4: cloud shadow  Bit 5: snow
+    """
+    mask = np.ones_like(qa_band.values, dtype=bool)
+    for bit in QA_CLOUD_BITS:
+        mask = mask & ((qa_band.values.astype(int) >> bit) & 1 == 0)
+    # also mask fill pixels (bit 0)
+    mask = mask & ((qa_band.values.astype(int) >> 0) & 1 == 0)
+    return qa_band.copy(data=mask)
+
 
 def extract_landsat(
     pts_df,
@@ -248,7 +274,7 @@ def extract_landsat(
     time_window,
     resolution=250,
     max_cloud=50,
-    scene_index=0,
+    composite="median",
     neighborhood=0,
     use_cache=True,
     cache_dir=DEFAULT_CACHE_DIR,
@@ -256,26 +282,52 @@ def extract_landsat(
     """
     Extract Landsat-8 visible/NIR + thermal at each point.
 
-    Single scene (not composite) because LST from different dates can't be
-    meaningfully averaged — each scene captures a specific thermal snapshot.
+    Uses QA_PIXEL cloud masking + median composite across all scenes,
+    matching the approach used for Sentinel-2. This is critical for
+    cross-location consistency — without masking, cloudy pixels show up
+    as artificially cold LST values (clouds are cold in thermal IR),
+    which corrupts the UHI signal.
 
-    Data quality:
-      - DN=0 masked BEFORE scale factors (prevents -124°C garbage)
-      - vis: DN → surface reflectance (0–0.5 range)
-      - lwir11: DN → brightness temperature in °C
+    Processing steps:
+      1. Search Planetary Computer for Landsat-8 scenes in bbox + date range
+      2. Load vis bands, thermal band, and QA_PIXEL quality band
+      3. Apply QA_PIXEL mask: remove clouds, cloud shadow, snow, fill
+      4. Mask remaining nodata (DN=0 → NaN)
+      5. Apply USGS scale factors (DN → reflectance for vis, DN → °C for thermal)
+      6. Median composite across time (collapses to one clean raster)
+      7. Extract values at each point
+
+    Data units after extraction:
+      - vis bands (red, green, blue, nir08): surface reflectance (0 to ~0.5)
+      - lwir11: brightness temperature in °C (emissivity correction → LST
+        is applied later in features.py)
 
     Parameters
     ----------
+    pts_df : DataFrame
+        Must have Latitude, Longitude columns.
+    bbox : tuple
+        (south, west, north, east) in degrees.
+    time_window : str
+        Date range, e.g. "2024-01-15/2024-02-15".
+    resolution : int
+        Pixel size in meters. Higher = faster + less RAM.
+    max_cloud : int
+        Max scene-level cloud cover % for STAC search filter.
+        Individual pixels are still masked by QA_PIXEL regardless.
+    composite : str
+        How to combine scenes across time. Default "median".
+        Median is robust to outliers from any unmasked cloud edges.
     neighborhood : int
-        0 = nearest pixel (fast, default)
-        100 = 100×100 pixel bounding box median around each point
+        0 = nearest pixel (fast, default).
+        N = NxN pixel bounding box median around each point.
     """
     all_bands = LANDSAT_VIS_BANDS + LANDSAT_THERMAL
 
     cache_params = dict(
         bbox=bbox, time_window=time_window,
         resolution=resolution, pid=points_fingerprint(pts_df),
-        neighborhood=neighborhood,
+        neighborhood=neighborhood, composite=composite,
     )
     if use_cache:
         cached = cache_get("landsat", cache_dir, **cache_params)
@@ -297,9 +349,16 @@ def extract_landsat(
     if not items:
         return None
 
-    # load vis and thermal separately (different scale factors)
+    # log scene dates so users can verify temporal coverage
+    for i, item in enumerate(items):
+        dt = item.properties.get("datetime", "?")
+        cc = item.properties.get("eo:cloud_cover", "?")
+        print(f"[Landsat]   scene {i}: {dt}  cloud={cc}%")
+
+    # load vis, thermal, and QA_PIXEL together
+    load_vis = LANDSAT_VIS_BANDS + ["qa_pixel"]
     data_vis = stac_load(
-        items, bands=LANDSAT_VIS_BANDS, crs="EPSG:4326", resolution=scale,
+        items, bands=load_vis, crs="EPSG:4326", resolution=scale,
         chunks={"x": 2048, "y": 2048}, dtype="uint16",
         patch_url=planetary_computer.sign, bbox=stac_bbox,
     )
@@ -309,33 +368,46 @@ def extract_landsat(
         patch_url=planetary_computer.sign, bbox=stac_bbox,
     )
 
-    # MASK NODATA BEFORE scaling
-    data_vis = data_vis.where(data_vis > 0)
-    data_therm = data_therm.where(data_therm > 0)
+    # QA_PIXEL cloud mask: True = clear, False = cloud/shadow/snow/fill
+    qa = data_vis["qa_pixel"]
+    clear_mask = _qa_cloud_mask(qa)
 
-    # apply Landsat C2L2 scale factors
-    # IMPORTANT: lwir11 output is BRIGHTNESS TEMPERATURE, not LST.
-    # Emissivity correction → LST is done in features.py
-    data_vis = data_vis.astype(float) * LANDSAT_VIS_SCALE + LANDSAT_VIS_OFFSET
-    data_therm = data_therm.astype(float) * LANDSAT_THERM_SCALE + LANDSAT_THERM_OFFSET - 273.15
+    # apply cloud mask to vis and thermal bands
+    data_vis_clean = data_vis[LANDSAT_VIS_BANDS].where(clear_mask)
+    data_therm_clean = data_therm.where(clear_mask)
 
-    # pick single scene (sorted by cloud cover in search)
-    d_vis = data_vis.isel(time=scene_index).compute()
-    d_therm = data_therm.isel(time=scene_index).compute()
+    # mask raw nodata (DN=0 can still exist in non-masked areas)
+    data_vis_clean = data_vis_clean.where(data_vis_clean > 0)
+    data_therm_clean = data_therm_clean.where(data_therm_clean > 0)
 
-    # merge vis + thermal into one dataset for unified extraction
-    combined = xr.merge([d_vis, d_therm])
+    # apply USGS Landsat C2 L2 scale factors AFTER masking
+    # lwir11 output is BRIGHTNESS TEMPERATURE, not LST.
+    # Emissivity correction → LST is done later in features.py.
+    data_vis_scaled = data_vis_clean.astype(float) * LANDSAT_VIS_SCALE + LANDSAT_VIS_OFFSET
+    data_therm_scaled = data_therm_clean.astype(float) * LANDSAT_THERM_SCALE + LANDSAT_THERM_OFFSET - 273.15
 
-    # extract at points using shared function
+    # median composite across time — collapses all scenes into one clean raster.
+    # This is safe within a ~30-day window in the same season.
+    # Median is robust to residual cloud edges that QA_PIXEL misses.
+    comp_vis = getattr(data_vis_scaled, composite)(dim="time").compute()
+    comp_therm = getattr(data_therm_scaled, composite)(dim="time").compute()
+
+    # merge vis + thermal composites
+    combined = xr.merge([comp_vis, comp_therm])
+
+    # extract at points
     df = _extract_at_points(combined, all_bands, pts_df, neighborhood, scale)
 
-    del data_vis, data_therm, d_vis, d_therm, combined
+    del data_vis, data_therm, data_vis_clean, data_therm_clean
+    del data_vis_scaled, data_therm_scaled, comp_vis, comp_therm, combined
 
     # report quality
     valid_thermal = df["lwir11"].notna().sum()
     bad_thermal = ((df["lwir11"] < -50) | (df["lwir11"] > 80)).sum()
+    nan_thermal = df["lwir11"].isna().sum()
     print(f"[Landsat] {len(df)} points × {len(all_bands)} bands")
-    print(f"[Landsat] lwir11: {valid_thermal} valid, {bad_thermal} out-of-range (< -50 or > 80°C)")
+    print(f"[Landsat] lwir11: {valid_thermal} valid, {nan_thermal} NaN, "
+          f"{bad_thermal} out-of-range (< -50 or > 80°C)")
 
     if use_cache:
         cache_put(df, "landsat", cache_dir, **cache_params)

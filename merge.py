@@ -47,7 +47,6 @@ def build_dataset(
     compute_features=True,
     max_cloud_s2=30,
     max_cloud_landsat=50,
-    landsat_scene=0,
     neighborhood=0,
     buildings_shp=None,
     buildings_csv=None,
@@ -103,7 +102,7 @@ def build_dataset(
     if "landsat" in sources:
         df_l = extract_landsat(
             pts_df, bbox, time_window, resolution,
-            max_cloud=max_cloud_landsat, scene_index=landsat_scene,
+            max_cloud=max_cloud_landsat,
             neighborhood=neighborhood,
             use_cache=use_cache, cache_dir=cache_dir,
         )
@@ -298,7 +297,6 @@ def build_resolution_sweep(
                 df_l = extract_landsat(
                     pts_df, kwargs["bbox"], kwargs["time_window"], res,
                     max_cloud=kwargs.get("max_cloud_landsat", 50),
-                    scene_index=kwargs.get("landsat_scene", 0),
                     neighborhood=kwargs.get("neighborhood", 0),
                     use_cache=use_cache, cache_dir=cache_dir,
                 )
