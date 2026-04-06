@@ -36,3 +36,6 @@ __pycache__/
 .DS_Store
 .env
 .env.*
+
+# Generated outputs (not versioned)
+outputs/
