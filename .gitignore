@@ -27,3 +27,12 @@ venv/
 # iCloud / backup
 .git_backup/
 **/.git_backup/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.DS_Store
+.env
+.env.*
