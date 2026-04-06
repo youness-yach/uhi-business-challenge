@@ -1,0 +1,29 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Logs
+*.log
+
+# Large / local-only geodata (use README to describe sources)
+*.shp
+*.dbf
+*.shx
+*.prj
+
+# Optional: very large archives
+*.zip
+*.tar.gz
+
+# iCloud / backup
+.git_backup/
+**/.git_backup/

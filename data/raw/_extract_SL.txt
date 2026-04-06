@@ -1,0 +1,850 @@
+
+================================================================================
+### CELL 0 (markdown)
+================================================================================
+# Sierra Leone UHI Classification
+
+**Class based classification**
+
+Predicting Urban Heat Island intensity classes (High / Medium / Low) for Freetown, Sierra Leone, using labeled training data from Santiago (Chile) and Rio de Janeiro (Brazil). The fundamental challenge is **cross-city generalization**: models trained in one urban environment must transfer to a city with entirely different geography, climate, and built form. This notebook walks through the EDA that motivated our approach, demonstrates why naive transfer fails, and builds a source-specialist OVR ensemble that exploits asymmetric transfer patterns between the two training cities.
+
+================================================================================
+### CELL 1 (code)
+================================================================================
+import os, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import QuantileTransformer, LabelEncoder
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score, classification_report
+from sklearn.cluster import KMeans
+from scipy.optimize import minimize
+
+warnings.filterwarnings('ignore')
+sns.set_style('whitegrid')
+
+DATA_DIR = '/lakehouse/default/Files'
+SPEC = ['lwir11', 'LST', 'SWIR2_NIR', 'blue', 'nir08']
+
+================================================================================
+### CELL 2 (code)
+================================================================================
+# Load datasets — use building-enriched versions if available
+dfs = {}
+for name in ['Chile', 'Brazil', 'Sierra_Leone']:
+    bldg = f'{DATA_DIR}/buildings_{name}.csv'
+    base = f'{DATA_DIR}/dataset_100m_{name}.csv'
+    dfs[name] = pd.read_csv(bldg if os.path.exists(bldg) else base)
+
+for name in ['Chile', 'Brazil', 'Sierra_Leone']:
+    print(f'{name}: {len(dfs[name]):,} rows, {dfs[name].shape[1]} cols')
+
+================================================================================
+### CELL 3 (code)
+================================================================================
+RAW = ['LST', 'NDVI', 'NDBI', 'emissivity', 'NDVI_Landsat', 'elevation']
+for name in ['Chile', 'Brazil']:
+    dfs[name] = dfs[name].dropna(subset=RAW).copy()
+
+df_sl = dfs['Sierra_Leone'].copy()
+for f in RAW:
+    if f in df_sl.columns:
+        df_sl[f] = df_sl[f].fillna(df_sl[f].median())
+
+print(f'After cleaning: Chile={len(dfs["Chile"]):,}, Brazil={len(dfs["Brazil"]):,}, SL={len(df_sl):,}')
+print(f'\nChile class dist:\n{dfs["Chile"]["UHI_Class"].value_counts().to_string()}')
+print(f'\nBrazil class dist:\n{dfs["Brazil"]["UHI_Class"].value_counts().to_string()}')
+
+================================================================================
+### CELL 4 (markdown)
+================================================================================
+## 1. EDA: Why Do Cross-City Models Struggle?
+
+The core challenge in this competition is that Chile and Brazil define UHI classes relative to their own thermal baselines. Santiago (Chile) is a semi-arid city at ~500m elevation with dry summers, while Rio de Janeiro (Brazil) is a tropical coastal city with high humidity year-round. Their absolute temperature ranges barely overlap, Chile's "High" UHI areas run around 43°C while Brazil's "Low" areas sit near 42°C. A model trained on raw temperatures would map almost every Chilean point to Brazil's "High" class and vice versa, because the features carry city-specific fingerprints rather than universal UHI signals.
+
+Let's visualize this overlap problem directly, then examine whether additional features help or hurt.
+
+================================================================================
+### CELL 5 (code)
+================================================================================
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, name in zip(axes, ['Chile', 'Brazil']):
+    for cls in ['High', 'Medium', 'Low']:
+        sub = dfs[name][dfs[name]['UHI_Class'] == cls]['LST']
+        ax.hist(sub, bins=40, alpha=0.5, label=cls, density=True)
+    ax.set_title(f'{name} — LST by UHI Class')
+    ax.set_xlabel('LST (°C)')
+    ax.legend()
+
+# Combined overlay
+for cls_col, cls in zip(['red', 'orange', 'blue'], ['High', 'Medium', 'Low']):
+    for name, ls in [('Chile', '-'), ('Brazil', '--')]:
+        sub = dfs[name][dfs[name]['UHI_Class'] == cls]['LST']
+        axes[2].hist(sub, bins=40, alpha=0.3, density=True, linestyle=ls,
+                     label=f'{name} {cls}', color=cls_col)
+axes[2].set_title('Combined — LST Overlap')
+axes[2].set_xlabel('LST (°C)')
+axes[2].legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 6 (code)
+================================================================================
+# Median LST
+table = (pd.DataFrame({country: 
+            [dfs[country].loc[dfs[country]['UHI_Class'] == cls, 'LST'].median()
+            for cls in ['High', 'Medium', 'Low']]
+        for country in ['Chile', 'Brazil']},
+    index=['High', 'Medium', 'Low']).round(1))
+
+print(f"====== Medain LST ======")
+print(table.to_string())
+
+================================================================================
+### CELL 7 (markdown)
+================================================================================
+Note: As expected, Chile's **High** class (~43°C) overlaps almost perfectly with Brazil's **Low** class (~42°C). This means absolute LST is useless as a cross-city feature — a model trained on Chile would predict nearly everything in Brazil as "Low" because Brazil's temperatures fall in Chile's cool range, and vice versa. The implication is stark: any successful cross-city model must learn *relative* thermal patterns rather than *absolute* temperature thresholds.
+
+The distributions also show that within each city, the three classes do separate reasonably well by LST. The problem is not that UHI classes lack a thermal signature. It's that the signature is anchored to each city's baseline temperature, which varies by ~10°C between Santiago and Rio.
+
+================================================================================
+### CELL 8 (code)
+================================================================================
+fig, axes = plt.subplots(1, len(SPEC), figsize=(18, 3.5))
+for ax, feat in zip(axes, SPEC):
+    data = [dfs['Chile'][feat].dropna(), dfs['Brazil'][feat].dropna(), df_sl[feat].dropna()]
+    ax.boxplot(data, labels=['Chile', 'Brazil', 'SL'])
+    ax.set_title(feat)
+plt.suptitle('Spectral Band Ranges by City', y=1.02, fontsize=14)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 9 (markdown)
+================================================================================
+Every spectral band sits at a different absolute range per city. The `lwir11` and `LST` bands reflect each city's thermal baseline, `SWIR2_NIR` captures surface material properties that vary with local geology and building materials, and `blue` and `nir08` respond to atmospheric conditions and vegetation density. Sierra Leone's distributions are shifted relative to both training cities in most bands, which means even non-thermal features carry a city fingerprint.
+
+This confirms that **we cannot use raw feature values for cross-city transfer**. We need a normalization step that removes city-specific scale while preserving the relative structure. Which is exactly what quantile transformation does.
+
+================================================================================
+### CELL 10 (markdown)
+================================================================================
+## 2. EDA: Do More Features Help?
+
+A natural instinct is to throw every available feature at the model — indices like NDVI and NDBI, building morphology metrics, elevation, emissivity. But more features also mean more dimensions where city-specific noise can hide, making cross-city transfer harder. Let's check the correlation structure to understand which features carry independent information versus redundant signal.
+
+================================================================================
+### CELL 11 (code)
+================================================================================
+IDX = [c for c in ['NDVI', 'NDBI', 'BSI', 'NDWI', 'Albedo', 'EVI'] if c in dfs['Chile'].columns]
+all_feats = SPEC + IDX
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+for ax, name in zip(axes, ['Chile', 'Brazil']):
+    df_city = dfs[name]
+    feats = [c for c in all_feats if c in df_city.columns]
+    corr = df_city[feats].corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    sns.heatmap(corr, mask=mask, annot=True, fmt='.2f', cmap='RdBu_r',
+                center=0, vmin=-1, vmax=1, square=True, linewidths=0.5,
+                annot_kws={'size': 8}, ax=ax)
+    ax.set_title(f'{name} Feature Correlation', fontsize=13)
+
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 12 (markdown)
+================================================================================
+The correlation matrices reveal massive redundancy among the candidate features. NDVI, NDBI, and the other indices are heavily correlated with the base spectral bands. NDBI is essentially a linear combination of SWIR2_NIR and nir08, while NDVI is just nir08 minus red divided by their sum. Adding these derived features doesn't introduce new information; it just duplicates existing signal in a form that increases dimensionality without improving discriminability.
+
+Our 1,020-config feature search confirmed this empirically: **the best-performing models used only the 5 base spectral bands** (`lwir11`, `LST`, `SWIR2_NIR`, `blue`, `nir08`). Every attempt to add building metrics, indices, spatial features, or texture statistics degraded cross-city transfer F1. The spectral bands carry the core UHI signal; indices add correlated noise that confuses PCA and inflates the feature space needlessly.
+
+================================================================================
+### CELL 13 (markdown)
+================================================================================
+## 3. Preprocessing: Quantile Transform → PCA
+
+**Quantile Transform (QT)** maps each city's feature distribution to a common uniform [0, 1] range independently. This is the critical domain adaptation step. It removes absolute scale differences (like Santiago's 43°C High overlapping with Rio's 42°C Low) while preserving the relative ordering of points within each city. After QT, a point at the 90th percentile of LST in Chile and one at the 90th percentile in Brazil both become 0.9, regardless of their original Celsius values.
+
+**PCA** then extracts the dominant variance axes from the normalized features. Because QT has already harmonized the scales, PCA can find components that reflect genuine spectral structure rather than city-specific offsets. We apply QT independently to each dataset (train and test separately), then fit PCA on the training data and transform the test data. This ensures no information leaks from the target domain.
+
+================================================================================
+### CELL 14 (code)
+================================================================================
+fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+for j, feat in enumerate(['LST', 'lwir11', 'nir08']):
+    for name, color in [('Chile', 'C0'), ('Brazil', 'C1'), ('SL', 'C2')]:
+        df_city = dfs[name] if name != 'SL' else df_sl
+        vals = df_city[feat].dropna()
+        axes[0, j].hist(vals, bins=40, alpha=0.4, label=name, color=color, density=True)
+    axes[0, j].set_title(f'{feat} — Raw')
+    axes[0, j].legend(fontsize=8)
+
+    for name, color in [('Chile', 'C0'), ('Brazil', 'C1'), ('SL', 'C2')]:
+        df_city = dfs[name] if name != 'SL' else df_sl
+        vals = df_city[feat].dropna().values.reshape(-1, 1)
+        qt = QuantileTransformer(n_quantiles=min(1000, len(vals)),
+                                 output_distribution='uniform', random_state=42)
+        qt_vals = qt.fit_transform(vals)
+        axes[1, j].hist(qt_vals, bins=40, alpha=0.4, label=name, color=color, density=True)
+    axes[1, j].set_title(f'{feat} — After QT')
+    axes[1, j].legend(fontsize=8)
+
+plt.suptitle('Quantile Transform Normalizes City Distributions', y=1.02, fontsize=14)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 15 (markdown)
+================================================================================
+After QT, all three cities share the same [0, 1] range and uniform shape. The relative ordering within each city is preserved. If point A was hotter than point B in raw LST, it remains higher after transformation. But the absolute temperature gap between cities is eliminated, which is exactly what we need for cross-city transfer.
+
+Notice that the QT is applied **independently** to each city. We do not fit on Chile+Brazil and then transform SL, that would impose the training distribution onto the target domain. Instead, each city gets its own QT fit, ensuring that the transformation captures the local distributional structure.
+
+================================================================================
+### CELL 16 (code)
+================================================================================
+# PCA on QT-transformed Chile+Brazil
+df_both = pd.concat([dfs['Chile'], dfs['Brazil']], ignore_index=True)
+X_both = df_both[SPEC].fillna(0).values
+qt = QuantileTransformer(n_quantiles=min(1000, len(X_both)),
+                         output_distribution='uniform', random_state=42)
+X_qt = qt.fit_transform(X_both)
+
+pca_full = PCA(random_state=42)
+pca_full.fit(X_qt)
+
+fig, ax = plt.subplots(figsize=(6, 4))
+cumvar = np.cumsum(pca_full.explained_variance_ratio_)
+ax.bar(range(1, len(cumvar)+1), pca_full.explained_variance_ratio_, alpha=0.6, label='Individual')
+ax.plot(range(1, len(cumvar)+1), cumvar, 'ro-', label='Cumulative')
+ax.axhline(0.96, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('Component')
+ax.set_ylabel('Explained Variance Ratio')
+ax.set_title('PCA on QT-Transformed Spectral Bands')
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+for i, (ev, cum) in enumerate(zip(pca_full.explained_variance_ratio_, cumvar)):
+    print(f'  PC{i}: {ev:.3f}  (cumulative: {cum:.3f})')
+
+================================================================================
+### CELL 17 (markdown)
+================================================================================
+**3 components capture ~96% of variance.** PC3 and PC4 add noise rather than signal. This makes physical sense, the 5 spectral bands are measuring overlapping aspects of the same surface properties (thermal emission, vegetation reflectance, surface material), so the intrinsic dimensionality is lower than 5. Using PCA(3) concentrates the signal and suppresses the feature-level noise that would otherwise confuse the classifier.
+
+================================================================================
+### CELL 18 (code)
+================================================================================
+pca3 = PCA(n_components=3, random_state=42)
+pca3.fit(X_qt)
+
+loadings = pd.DataFrame(pca3.components_.T, index=SPEC, columns=['PC0', 'PC1', 'PC2'])
+print('PCA Loadings (on QT-transformed features):')
+print(loadings.round(3))
+print(f'\nVariance explained: {pca3.explained_variance_ratio_.round(3)}')
+
+fig, ax = plt.subplots(figsize=(8, 4))
+loadings.plot(kind='bar', ax=ax)
+ax.set_title('PCA Component Loadings')
+ax.set_ylabel('Loading')
+ax.legend(title='Component')
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 19 (markdown)
+================================================================================
+## 4. Cross-City Transfer: Which Source Teaches Which Class?
+
+This is the most critical analysis in the notebook. We use Leave-One-City-Out (LOCO) evaluation: train on one city, predict the other, and measure F1 per class. If transfer quality is symmetric (Chile→Brazil ≈ Brazil→Chile for every class), then a simple combined model would suffice. But if transfer is **asymmetric**, certain source cities teach certain classes better — then we need a more nuanced approach.
+
+We also report the **train-test F1 gap** throughout this section. A large gap (train F1 much higher than test F1) indicates overfitting to the source city's feature distribution, which means the learned patterns are city-specific rather than universal. A small gap suggests the model is learning generalizable UHI structure.
+
+================================================================================
+### CELL 20 (code)
+================================================================================
+le = LabelEncoder()
+le.fit(['High', 'Low', 'Medium'])
+
+def qt_pca_transform(X_tr_raw, X_te_raw, n_pca=3):
+    """Independent QT per dataset, PCA fit on train only."""
+    qt_tr = QuantileTransformer(n_quantiles=min(1000, len(X_tr_raw)),
+                                output_distribution='uniform', random_state=42)
+    qt_te = QuantileTransformer(n_quantiles=min(1000, len(X_te_raw)),
+                                output_distribution='uniform', random_state=42)
+    X_tr = qt_tr.fit_transform(X_tr_raw)
+    X_te = qt_te.fit_transform(X_te_raw)
+    
+    if n_pca and n_pca < X_tr.shape[1]:
+        pca = PCA(n_components=n_pca, random_state=42)
+        X_tr = pca.fit_transform(X_tr)
+        X_te = pca.transform(X_te)
+    else:
+        pca = None
+    return X_tr, X_te, pca
+
+================================================================================
+### CELL 21 (code)
+================================================================================
+# LOCO: Train on one city, predict the other — with train-test F1 gap
+for src, tgt in [('Chile', 'Brazil'), ('Brazil', 'Chile')]:
+    X_tr, X_te, _ = qt_pca_transform(
+        dfs[src][SPEC].fillna(0).values,
+        dfs[tgt][SPEC].fillna(0).values
+    )
+    y_tr = le.transform(dfs[src]['UHI_Class'])
+    y_te = le.transform(dfs[tgt]['UHI_Class'])
+    
+    rf = RandomForestClassifier(n_estimators=300, max_depth=12,
+                                min_samples_leaf=10, class_weight='balanced',
+                                random_state=42, n_jobs=-1)
+    rf.fit(X_tr, y_tr)
+    
+    y_pred_tr = rf.predict(X_tr)
+    y_pred_te = rf.predict(X_te)
+    f1_tr = f1_score(y_tr, y_pred_tr, average='weighted')
+    f1_te = f1_score(y_te, y_pred_te, average='weighted')
+    
+    print(f'\n{src} → {tgt}:  Train F1={f1_tr:.3f}  Test F1={f1_te:.3f}  Gap={f1_tr - f1_te:.3f}')
+    print(classification_report(y_te, y_pred_te, target_names=le.classes_, digits=3))
+
+================================================================================
+### CELL 22 (markdown)
+================================================================================
+Notice the **asymmetry**: Chile→Brazil and Brazil→Chile don't transfer equally for every class. This is the first hint that a single combined model may not be optimal. Each source city has learned patterns that map differently onto the target city's class structure. The train-test gap also tells us how much of the model's apparent performance is due to memorizing source-city specifics versus learning transferable UHI patterns.
+
+================================================================================
+### CELL 23 (code)
+================================================================================
+# Per-class OVR transfer analysis
+# Train binary classifier for each class from each source → test on the other
+results = []
+
+for src, tgt in [('Chile', 'Brazil'), ('Brazil', 'Chile')]:
+    X_tr, X_te, _ = qt_pca_transform(
+        dfs[src][SPEC].fillna(0).values,
+        dfs[tgt][SPEC].fillna(0).values
+    )
+    y_tr = le.transform(dfs[src]['UHI_Class'])
+    y_te = le.transform(dfs[tgt]['UHI_Class'])
+    
+    for cls_name in ['High', 'Medium', 'Low']:
+        cls_idx = le.transform([cls_name])[0]
+        y_tr_bin = (y_tr == cls_idx).astype(int)
+        y_te_bin = (y_te == cls_idx).astype(int)
+        
+        rf = RandomForestClassifier(n_estimators=300, max_depth=10,
+                                    class_weight='balanced', random_state=42, n_jobs=-1)
+        rf.fit(X_tr, y_tr_bin)
+        
+        f1_tr = f1_score(y_tr_bin, rf.predict(X_tr))
+        f1_te = f1_score(y_te_bin, rf.predict(X_te))
+        
+        results.append({'source': src, 'target': tgt, 'class': cls_name,
+                        'f1_train': f1_tr, 'f1_test': f1_te, 'gap': f1_tr - f1_te})
+
+df_loco = pd.DataFrame(results)
+pivot_te = df_loco.pivot_table(index='class', columns='source', values='f1_test')
+pivot_gap = df_loco.pivot_table(index='class', columns='source', values='gap')
+print('Per-Class Transfer F1 (test):')
+print(pivot_te.round(3))
+print('\nTrain-Test Gap:')
+print(pivot_gap.round(3))
+
+================================================================================
+### CELL 24 (code)
+================================================================================
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+sns.heatmap(pivot_te, annot=True, fmt='.3f', cmap='YlOrRd', ax=axes[0],
+            vmin=0, vmax=1, square=True, linewidths=0.5)
+axes[0].set_title('Per-Class Transfer F1 (Test)')
+
+sns.heatmap(pivot_gap, annot=True, fmt='.3f', cmap='RdYlGn_r', ax=axes[1],
+            vmin=0, vmax=0.5, square=True, linewidths=0.5)
+axes[1].set_title('Train-Test F1 Gap (Overfitting)')
+
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 25 (markdown)
+================================================================================
+**Key finding**: The transfer quality is strongly class-dependent. This makes physical sense. Chile (semi-arid, high elevation) and Brazil (tropical, coastal) have different urban morphologies, and each city's UHI class definitions map onto different spectral signatures. Chile's transitional peri-urban zones may share spectral characteristics with Freetown's Medium-intensity areas, while Brazil's dense tropical urban core resembles Freetown's High-intensity zones.
+
+The train-test gap is also informative. A large gap means the model is partly memorizing city-specific patterns rather than learning universal ones. Classes with small gaps are better candidates for cross-city transfer.
+
+================================================================================
+### CELL 26 (markdown)
+================================================================================
+## 5. Transfer to Sierra Leone: Chile vs Brazil vs Both
+
+LOCO between Chile and Brazil tells us about inter-city transfer, but our real target is **Sierra Leone**. Since we have no SL ground truth, we build unsupervised pseudo-labels using KMeans clustering on the SL feature space, with clusters mapped to UHI classes by mean LST (physically grounded: hotter clusters = higher UHI). These pseudo-labels aren't perfect, but they give us a reasonable evaluation baseline for comparing source configurations.
+
+================================================================================
+### CELL 27 (code)
+================================================================================
+# Build SL pseudo-truth via unsupervised KMeans
+df_train = pd.concat([dfs['Chile'], dfs['Brazil']], ignore_index=True)
+
+X_sl_raw = df_sl[SPEC].fillna(0).values
+qt_sl = QuantileTransformer(n_quantiles=min(1000, len(X_sl_raw)),
+                            output_distribution='uniform', random_state=42)
+X_sl_qt = qt_sl.fit_transform(X_sl_raw)
+pca_sl = PCA(n_components=3, random_state=42)
+X_sl_pca = pca_sl.fit_transform(X_sl_qt)
+
+km = KMeans(n_clusters=3, random_state=7, init='k-means++', n_init=30)
+clusters = km.fit_predict(X_sl_pca)
+
+# Map by mean LST — physically grounded
+agg = [(c, df_sl.iloc[clusters == c]['LST'].mean()) for c in range(3)]
+agg.sort(key=lambda x: x[1])
+cmap = {agg[0][0]: 'Low', agg[1][0]: 'Medium', agg[2][0]: 'High'}
+y_sl_pseudo = np.array([cmap[c] for c in clusters])
+
+print(f'SL pseudo-truth distribution: {dict(pd.Series(y_sl_pseudo).value_counts())}')
+
+================================================================================
+### CELL 28 (code)
+================================================================================
+# Full source comparison: Chile, Brazil, Both → SL (per-class OVR)
+sources = {
+    'Chile': dfs['Chile'],
+    'Brazil': dfs['Brazil'],
+    'Both': df_train,
+}
+
+y_sl_enc = le.transform(y_sl_pseudo)
+
+sl_results = []
+for src_name, df_src in sources.items():
+    X_tr, X_te, _ = qt_pca_transform(
+        df_src[SPEC].fillna(0).values,
+        df_sl[SPEC].fillna(0).values
+    )
+    y_tr = le.transform(df_src['UHI_Class'])
+    
+    for cls_name in ['High', 'Medium', 'Low']:
+        cls_idx = le.transform([cls_name])[0]
+        y_tr_bin = (y_tr == cls_idx).astype(int)
+        y_te_bin = (y_sl_enc == cls_idx).astype(int)
+        
+        rf = RandomForestClassifier(n_estimators=300, max_depth=10,
+                                    class_weight='balanced', random_state=42, n_jobs=-1)
+        rf.fit(X_tr, y_tr_bin)
+        
+        f1_tr = f1_score(y_tr_bin, rf.predict(X_tr))
+        prob = rf.predict_proba(X_te)[:, 1]
+        y_pred = (prob > 0.5).astype(int)
+        f1_te = f1_score(y_te_bin, y_pred)
+        prec = (y_pred & y_te_bin).sum() / max(y_pred.sum(), 1)
+        rec = (y_pred & y_te_bin).sum() / max(y_te_bin.sum(), 1)
+        
+        sl_results.append({'source': src_name, 'class': cls_name,
+                           'f1_train': f1_tr, 'f1_test': f1_te, 'gap': f1_tr - f1_te,
+                           'precision': prec, 'recall': rec})
+
+df_sl_transfer = pd.DataFrame(sl_results)
+print('Source → SL Transfer Quality (per class):')
+for cls in ['High', 'Medium', 'Low']:
+    print(f'\n  {cls}:')
+    sub = df_sl_transfer[df_sl_transfer['class'] == cls]
+    for _, row in sub.iterrows():
+        print(f"    {row['source']:<8} Train={row['f1_train']:.3f}  Test={row['f1_test']:.3f}  Gap={row['gap']:.3f}  |  Prec={row['precision']:.3f}  Rec={row['recall']:.3f}")
+
+================================================================================
+### CELL 29 (code)
+================================================================================
+pivot_sl = df_sl_transfer.pivot_table(index='class', columns='source', values='f1_test')
+pivot_sl = pivot_sl[['Chile', 'Brazil', 'Both']]
+
+fig, ax = plt.subplots(figsize=(7, 4))
+sns.heatmap(pivot_sl, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax,
+            vmin=0, vmax=1, square=True, linewidths=0.5, annot_kws={'size': 12})
+ax.set_title('Source → SL Transfer F1 by Class', fontsize=13)
+plt.tight_layout()
+plt.show()
+
+# Identify best source per class
+print('\nBest source per class:')
+for cls in ['High', 'Medium', 'Low']:
+    row = pivot_sl.loc[cls]
+    best = row.idxmax()
+    print(f'  {cls}: {best} (F1={row[best]:.3f})')
+
+================================================================================
+### CELL 30 (markdown)
+================================================================================
+## 6. Feature Importance by Class and Source
+
+Understanding *which* spectral features drive each class detection helps validate that the model is learning physically meaningful patterns rather than artifacts. We train without PCA here so that feature importances map directly to interpretable bands. LST and lwir11 should dominate (they measure the thermal signal that defines UHI), but differences between classes and sources reveal which secondary features matter for discrimination.
+
+================================================================================
+### CELL 31 (code)
+================================================================================
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+for ax, cls_name in zip(axes, ['High', 'Medium', 'Low']):
+    for src_name, color in [('Chile', 'C0'), ('Brazil', 'C1')]:
+        df_src = dfs[src_name]
+        X = df_src[SPEC].fillna(0).values
+        qt = QuantileTransformer(n_quantiles=min(1000, len(X)),
+                                 output_distribution='uniform', random_state=42)
+        X = qt.fit_transform(X)
+        y = (df_src['UHI_Class'] == cls_name).astype(int)
+        
+        rf = RandomForestClassifier(n_estimators=200, max_depth=10,
+                                    class_weight='balanced', random_state=42, n_jobs=-1)
+        rf.fit(X, y)
+        imp = rf.feature_importances_
+        
+        x_pos = np.arange(len(SPEC))
+        width = 0.35
+        offset = -width/2 if src_name == 'Chile' else width/2
+        ax.bar(x_pos + offset, imp, width, label=src_name, alpha=0.8, color=color)
+    
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(SPEC, rotation=45)
+    ax.set_title(f'{cls_name} Class')
+    ax.set_ylabel('Importance')
+    ax.legend()
+
+plt.suptitle('Feature Importance by Class and Source (no PCA)', y=1.02, fontsize=13)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 32 (markdown)
+================================================================================
+**LST and lwir11 dominate** across the board, thermal features are the primary UHI discriminators, which aligns with the physics of urban heat islands. The interesting variation is in the secondary features: `blue` and `nir08` contribute differently depending on the class and source city. For the Medium class especially, the importance profile differs substantially between Chile and Brazil, which is consistent with our earlier finding that these two cities teach Medium differently.
+
+This reinforces the source-specialist concept: each source city has learned to weight the spectral features slightly differently for each class, reflecting genuine differences in how UHI manifests across urban morphology types.
+
+================================================================================
+### CELL 33 (markdown)
+================================================================================
+## 7. Model Comparison
+
+Before committing to the specialist architecture, let's verify that our model choice (Random Forest) and strategy (OVR) are reasonable. We compare RF multiclass, RF OVR, XGB multiclass, and XGB OVR on the same preprocessed data. All use the same QT→PCA(3) pipeline and are evaluated against the SL pseudo-labels, with train-test gap reported.
+
+================================================================================
+### CELL 34 (code)
+================================================================================
+from xgboost import XGBClassifier
+
+X_tr_all, X_sl_all, _ = qt_pca_transform(
+    df_train[SPEC].fillna(0).values,
+    df_sl[SPEC].fillna(0).values
+)
+y_tr_all = le.transform(df_train['UHI_Class'])
+
+models = {
+    'RF multi': RandomForestClassifier(n_estimators=300, max_depth=12,
+                                        min_samples_leaf=10, class_weight='balanced',
+                                        random_state=42, n_jobs=-1),
+    'XGB multi': XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.1,
+                                random_state=42, n_jobs=-1, eval_metric='mlogloss',
+                                verbosity=0),
+}
+
+print(f'{"Model":<15} {"Train F1":>10} {"Test F1":>10} {"Gap":>8}')
+print('-' * 45)
+for name, model in models.items():
+    model.fit(X_tr_all, y_tr_all)
+    f1_tr = f1_score(y_tr_all, model.predict(X_tr_all), average='weighted')
+    f1_te = f1_score(y_sl_enc, model.predict(X_sl_all), average='weighted')
+    print(f'{name:<15} {f1_tr:>10.3f} {f1_te:>10.3f} {f1_tr-f1_te:>8.3f}')
+
+================================================================================
+### CELL 35 (markdown)
+================================================================================
+---
+## 8. The Source-Specialist OVR Pipeline
+
+Based on everything above, our approach is clear: **train a separate binary classifier for each UHI class, using the source city that transfers best for that class.** This exploits the asymmetric transfer pattern we discovered, rather than forcing a single model to learn all three classes from a compromise dataset, we let each class specialist learn from its best teacher.
+
+The specialist configuration is derived directly from the transfer analysis above:
+- **High** → Brazil (F1=0.760, recall=0.908 ~ best source for High)
+- **Low** → Both / Chile+Brazil combined (F1=0.765, balanced precision/recall)
+- **Medium** → Chile (F1=0.618 ~ only source that produces meaningful Medium predictions)
+
+For context, a Brazil-only model (no specialist split) achieves just F1=0.53 overall with Medium collapsing to F1=0.38. A combined Chile+Brazil model without domain adaptation scores even worse at F1=0.48, with Medium at F1=0.28. The specialist approach avoids these failures by routing each class to its strongest teacher.
+
+Each specialist outputs a probability score for its class. The final prediction assigns each SL point to the class with the highest specialist score.
+
+================================================================================
+### CELL 36 (code)
+================================================================================
+# Source-specialist config — derived from transfer analysis
+SPECIALISTS = {
+    'High':   dfs['Brazil'],   # Brazil: F1=0.760, recall=0.908
+    'Low':    df_train,        # Both (Chile+Brazil): F1=0.765, balanced prec/rec
+    'Medium': dfs['Chile'],    # Chile: F1=0.618, only source that works
+}
+
+================================================================================
+### CELL 37 (code)
+================================================================================
+def train_specialist(df_src, cls_name, X_sl_raw):
+    """Train a binary OVR specialist for one class."""
+    X_tr_raw = df_src[SPEC].fillna(0).values
+    X_tr, X_te, pca = qt_pca_transform(X_tr_raw, X_sl_raw)
+    
+    y_tr = (df_src['UHI_Class'] == cls_name).astype(int).values
+    
+    rf = RandomForestClassifier(n_estimators=300, max_depth=10,
+                                class_weight='balanced', random_state=42, n_jobs=-1)
+    rf.fit(X_tr, y_tr)
+    
+    prob_tr = rf.predict_proba(X_tr)[:, 1]
+    prob_sl = rf.predict_proba(X_te)[:, 1]
+    f1_tr = f1_score(y_tr, (prob_tr > 0.5).astype(int))
+    
+    return prob_sl, f1_tr, rf
+
+================================================================================
+### CELL 38 (code)
+================================================================================
+X_sl_raw = df_sl[SPEC].fillna(0).values
+scores = {}
+src_labels = {'Chile': 'Chile', 'Brazil': 'Brazil'}
+
+for cls_name, df_src in SPECIALISTS.items():
+    prob, f1_tr, _ = train_specialist(df_src, cls_name, X_sl_raw)
+    scores[cls_name] = prob
+    n = len(df_src)
+    src = 'Chile' if n < 20000 else ('Brazil' if n < 30000 else 'Both')
+    
+    # Evaluate against pseudo-truth
+    y_te_bin = (y_sl_pseudo == cls_name).astype(int)
+    f1_te = f1_score(y_te_bin, (prob > 0.5).astype(int))
+    
+    print(f'{cls_name} specialist (source={src}): Train F1={f1_tr:.3f} Test F1={f1_te:.3f} Gap={f1_tr-f1_te:.3f} | mean_prob={prob.mean():.3f}, > 0.5={np.sum(prob > 0.5)}')
+
+================================================================================
+### CELL 39 (code)
+================================================================================
+score_matrix = np.column_stack([scores['High'], scores['Low'], scores['Medium']])
+y_raw = le.classes_[np.argmax(score_matrix, axis=1)]
+
+print(f'Raw specialist predictions: {dict(pd.Series(y_raw).value_counts())}')
+f1_raw = f1_score(y_sl_pseudo, y_raw, average='weighted')
+print(f'Weighted F1 vs pseudo-truth: {f1_raw:.3f}')
+print()
+print(classification_report(y_sl_pseudo, y_raw, target_names=['High', 'Low', 'Medium'], digits=3))
+
+================================================================================
+### CELL 40 (markdown)
+================================================================================
+## 9. Threshold Calibration
+
+The raw specialist scores won't match the expected SL distribution perfectly. We know the approximate target distribution from the competition (High ≈ 5087, Medium ≈ 6000, Low ≈ 3018). We can add per-class score offsets and optimize them to match this distribution using Nelder-Mead. This doesn't change the model. It just shifts decision boundaries to align with the known class prevalence.
+
+================================================================================
+### CELL 41 (code)
+================================================================================
+SL_KNOWN = {'High': 5087, 'Medium': 6000, 'Low': 3018}
+total = sum(SL_KNOWN.values())
+target_frac = {k: v/total for k, v in SL_KNOWN.items()}
+
+def calibrate(offsets):
+    adj = score_matrix.copy()
+    adj[:, 0] += offsets[0]  # High
+    adj[:, 1] += offsets[1]  # Low
+    adj[:, 2] += offsets[2]  # Medium
+    preds = le.classes_[np.argmax(adj, axis=1)]
+    dist = pd.Series(preds).value_counts(normalize=True)
+    err = sum((dist.get(c, 0) - target_frac[c])**2 for c in target_frac)
+    return err
+
+res = minimize(calibrate, [0, 0, 0], method='Nelder-Mead')
+print(f'Optimal offsets: High={res.x[0]:.4f}, Low={res.x[1]:.4f}, Medium={res.x[2]:.4f}')
+
+adj = score_matrix.copy()
+adj[:, 0] += res.x[0]
+adj[:, 1] += res.x[1]
+adj[:, 2] += res.x[2]
+y_cal = le.classes_[np.argmax(adj, axis=1)]
+
+print(f'\nCalibrated distribution: {dict(pd.Series(y_cal).value_counts())}')
+print(f'Target distribution:     {SL_KNOWN}')
+
+================================================================================
+### CELL 42 (code)
+================================================================================
+print('Calibrated vs pseudo-truth:')
+print(f'Weighted F1: {f1_score(y_sl_pseudo, y_cal, average="weighted"):.3f}')
+print()
+print(classification_report(y_sl_pseudo, y_cal, target_names=['High', 'Low', 'Medium'], digits=3))
+
+================================================================================
+### CELL 43 (code)
+================================================================================
+# Combine: assign each point to class with highest specialist score
+score_matrix = np.column_stack([scores['High'], scores['Low'], scores['Medium']])
+y_pred_raw = np.argmax(score_matrix, axis=1)
+# Map back: col 0=High, 1=Low, 2=Medium
+class_order = ['High', 'Low', 'Medium']
+y_pred_labels = np.array([class_order[i] for i in y_pred_raw])
+
+print('Raw specialist predictions:')
+print(pd.Series(y_pred_labels).value_counts())
+print(f'\nvs pseudo-truth F1: {f1_score(y_sl_pseudo, y_pred_labels, average="weighted"):.3f}')
+
+================================================================================
+### CELL 44 (markdown)
+================================================================================
+## 10. XGB Specialists | Alternative Model
+
+XGBoost may capture nonlinear interactions that Random Forest misses. We train the same specialist architecture but swap RF for XGB, then compare.
+
+================================================================================
+### CELL 45 (code)
+================================================================================
+def train_xgb_specialist(df_src, cls_name, X_sl_raw):
+    X_tr_raw = df_src[SPEC].fillna(0).values
+    X_tr, X_te, pca = qt_pca_transform(X_tr_raw, X_sl_raw)
+    y_tr = (df_src['UHI_Class'] == cls_name).astype(int).values
+    
+    xgb = XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.1,
+                         scale_pos_weight=len(y_tr[y_tr==0]) / max(len(y_tr[y_tr==1]), 1),
+                         random_state=42, n_jobs=-1, eval_metric='logloss', verbosity=0)
+    xgb.fit(X_tr, y_tr)
+    
+    prob_tr = xgb.predict_proba(X_tr)[:, 1]
+    prob_sl = xgb.predict_proba(X_te)[:, 1]
+    f1_tr = f1_score(y_tr, (prob_tr > 0.5).astype(int))
+    
+    return prob_sl, f1_tr, xgb
+
+scores_xgb = {}
+for cls_name, df_src in SPECIALISTS.items():
+    prob, f1_tr, _ = train_xgb_specialist(df_src, cls_name, X_sl_raw)
+    scores_xgb[cls_name] = prob
+    n = len(df_src)
+    src = 'Chile' if n < 20000 else ('Brazil' if n < 30000 else 'Both')
+    
+    y_te_bin = (y_sl_pseudo == cls_name).astype(int)
+    f1_te = f1_score(y_te_bin, (prob > 0.5).astype(int))
+    print(f'{cls_name} XGB specialist ({src}):  Train F1={f1_tr:.3f}  Test F1={f1_te:.3f}  Gap={f1_tr-f1_te:.3f}')
+
+score_matrix_xgb = np.column_stack([scores_xgb['High'], scores_xgb['Low'], scores_xgb['Medium']])
+
+================================================================================
+### CELL 46 (code)
+================================================================================
+def calibrate_xgb(offsets):
+    adj = score_matrix_xgb.copy()
+    adj[:, 0] += offsets[0]
+    adj[:, 1] += offsets[1]
+    adj[:, 2] += offsets[2]
+    preds = le.classes_[np.argmax(adj, axis=1)]
+    dist = pd.Series(preds).value_counts(normalize=True)
+    return sum((dist.get(c, 0) - target_frac[c])**2 for c in target_frac)
+
+res_xgb = minimize(calibrate_xgb, [0, 0, 0], method='Nelder-Mead')
+adj_xgb = score_matrix_xgb.copy()
+adj_xgb[:, 0] += res_xgb.x[0]
+adj_xgb[:, 1] += res_xgb.x[1]
+adj_xgb[:, 2] += res_xgb.x[2]
+y_cal_xgb = le.classes_[np.argmax(adj_xgb, axis=1)]
+
+print(f'XGB calibrated dist: {dict(pd.Series(y_cal_xgb).value_counts())}')
+f1_xgb = f1_score(y_sl_pseudo, y_cal_xgb, average='weighted')
+print(f'XGB weighted F1 vs pseudo: {f1_xgb:.3f}')
+
+================================================================================
+### CELL 47 (markdown)
+================================================================================
+## 11. Ensemble: Average RF + XGB Specialists
+
+A simple average of the RF and XGB specialist scores should be a strict improvement if the two models make different errors. This is the classic ensemble benefit. Diverse base models that agree on easy points but disagree on hard ones, with the average smoothing out individual mistakes.
+
+================================================================================
+### CELL 48 (code)
+================================================================================
+score_ensemble = (score_matrix + score_matrix_xgb) / 2
+
+def calibrate_ens(offsets):
+    adj = score_ensemble.copy()
+    adj[:, 0] += offsets[0]
+    adj[:, 1] += offsets[1]
+    adj[:, 2] += offsets[2]
+    preds = le.classes_[np.argmax(adj, axis=1)]
+    dist = pd.Series(preds).value_counts(normalize=True)
+    return sum((dist.get(c, 0) - target_frac[c])**2 for c in target_frac)
+
+res_ens = minimize(calibrate_ens, [0, 0, 0], method='Nelder-Mead')
+adj_ens = score_ensemble.copy()
+adj_ens[:, 0] += res_ens.x[0]
+adj_ens[:, 1] += res_ens.x[1]
+adj_ens[:, 2] += res_ens.x[2]
+y_cal_ens = le.classes_[np.argmax(adj_ens, axis=1)]
+
+print(f'Ensemble calibrated dist: {dict(pd.Series(y_cal_ens).value_counts())}')
+
+================================================================================
+### CELL 49 (code)
+================================================================================
+print('=== COMPARISON (calibrated, vs pseudo-truth) ===')
+for name, preds in [('RF specialist', y_cal), ('XGB specialist', y_cal_xgb), ('RF+XGB ensemble', y_cal_ens)]:
+    f1 = f1_score(y_sl_pseudo, preds, average='weighted')
+    print(f'  {name:<20} F1={f1:.3f}  dist={dict(pd.Series(preds).value_counts())}')
+
+================================================================================
+### CELL 50 (markdown)
+================================================================================
+## 12. Final Submission
+
+Pick the best-performing variant from the comparison above and generate the submission CSV. The submission uses the calibrated predictions to match the expected SL class distribution.
+
+================================================================================
+### CELL 51 (code)
+================================================================================
+# Pick the best variant — change y_final to whichever won above
+y_final = y_cal_ens  # or y_cal, y_cal_xgb
+
+sub = pd.DataFrame({
+    'Longitude': df_sl['Longitude'],
+    'Latitude': df_sl['Latitude'],
+    'UHI_Class': y_final
+})
+print(f'Final distribution: {dict(pd.Series(y_final).value_counts())}')
+print(f'Total: {len(sub)}')
+sub.head()
+
+================================================================================
+### CELL 52 (code)
+================================================================================
+out_path = f'{DATA_DIR}/class-based ensemble.csv'
+sub.to_csv(out_path, index=False)
+print(f'Saved to {out_path}')
+
+================================================================================
+### CELL 53 (markdown)
+================================================================================
+## Summary
+
+**Pipeline**: 5 spectral bands → Independent QT (uniform) → PCA(3) → Source-Specialist OVR
+
+**Key insight**: Cross-city UHI transfer is asymmetric. Chile and Brazil teach different classes with different fidelity. Rather than training a single model on combined data (which compromises on every class), we let each class learn from its best teacher:
+
+- **High** → Brazil specialist (F1=0.760, high recall 0.908 for dense tropical urban cores)
+- **Low** → Both specialist (F1=0.765, balanced precision/recall from combined training data)
+- **Medium** → Chile specialist (F1=0.618, only source with transferable Medium signal)
+
+Non-specialist baselines confirm this approach: Brazil-only achieves F1=0.53 (Medium F1=0.38), and Chile+Brazil without DA scores F1=0.48 (Medium F1=0.28).
+
+**Why this works**: Quantile transform removes city-specific absolute scales. PCA(3) concentrates 96% of spectral variance into 3 interpretable components. The specialist architecture then lets each binary classifier focus on a single class boundary, drawing from the training source whose urban morphology most closely matches the target pattern in Freetown.
+
+**Calibration**: Nelder-Mead optimization of per-class score offsets ensures the final distribution matches the known SL class prevalence, without changing the underlying model.

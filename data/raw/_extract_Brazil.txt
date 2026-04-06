@@ -1,0 +1,477 @@
+
+================================================================================
+### CELL 0 (markdown)
+================================================================================
+# Brazil UHI Classification
+
+Team 4:
+* Joao Ponte
+* Mickias Ambaye
+
+================================================================================
+### CELL 1 (markdown)
+================================================================================
+Train and evaluate a UHI classifier using Brazil data using building morphology, elevation, spectral indices, interaction terms. The model trains and predicts on the same distribution, so there's no domain gap to worry about. We use 5-fold stratified CV with RF and XGB to find the best setup, then train a final model on all data.
+
+================================================================================
+### CELL 2 (code)
+================================================================================
+import os, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, QuantileTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from xgboost import XGBClassifier
+
+warnings.filterwarnings('ignore')
+sns.set_style('whitegrid')
+
+================================================================================
+### CELL 3 (code)
+================================================================================
+# Load Brazil — prefer building-enriched Brazil file
+bldg = r'C:\Users\micki\OneDrive\Desktop\Coding\BC-II\Final\buildings_Brazil.csv'
+base = r'C:\Users\micki\OneDrive\Desktop\Coding\BC-II\Final\dataset_100m_Brazil.csv'
+
+source = bldg if os.path.exists(bldg) else base
+if not os.path.exists(source):
+    raise FileNotFoundError(f'Neither file exists:\n- {bldg}\n- {base}')
+
+df = pd.read_csv(source)
+
+print(f'Loaded: {source}')
+print(f'Rows: {len(df):,}  Cols: {df.shape[1]}')
+print(f'\nClass distribution:\n{df["UHI_Class"].value_counts().to_string()}')
+# print(f'\nColumns:\n{list(df.columns)}')
+
+================================================================================
+### CELL 4 (markdown)
+================================================================================
+## 1. Feature Selection
+
+In the cross-city pipeline we discovered that adding anything beyond the 5 base spectral bands hurt transfer performance, indices like NDVI and NDBI were redundant with the raw bands, and building/spatial features encoded city identity rather than UHI patterns. But that constraint was specific to cross-city generalization. Within a single city, building density directly measures the urban fabric that traps heat, and indices like NDVI capture local vegetation cooling effects. These features carry real UHI signal when the domain gap is removed. 
+
+We define four feature groups and include everything that exists in the dataset. Latitude and Longitude are excluded from the model features as they'd let the model memorize spatial locations rather than learn generalizable patterns from physical properties.
+
+================================================================================
+### CELL 5 (code)
+================================================================================
+# Define feature groups — use everything available EXCEPT lat/lon
+SPECTRAL = ['lwir11', 'LST', 'SWIR2_NIR', 'blue', 'nir08']
+INDICES = ['NDVI', 'NDBI', 'BSI', 'NDWI', 'Albedo', 'EVI', 'emissivity',
+           'SAVI', 'MNDWI', 'NDMI', 'ISA', 'BU', 'NDVI_Landsat']
+BUILDING = ['building_density_100m', 'building_coverage_ratio', 'bldg_mean_height',
+            'bldg_height_std', 'volume_density', 'bldg_count_100m', 'bldg_total_area',
+            'bldg_total_volume', 'bldg_max_height', 'bldg_height_range',
+            'mean_bldg_volume', 'bldg_height_max_ratio', 'sky_view_proxy',
+            'open_space_ratio', 'compactness']
+OTHER = ['elevation']
+
+# Keep only columns that exist — explicitly exclude Lat/Lon
+all_candidates = SPECTRAL + INDICES + BUILDING + OTHER
+FEATURES = [c for c in all_candidates if c in df.columns]
+
+print(f'Available features: {len(FEATURES)}')
+
+================================================================================
+### CELL 6 (markdown)
+================================================================================
+## 2. EDA: How Do Features Separate UHI Classes
+
+Brazil's absolute LST values are directly meaningful with a 50°C surface in Rio is genuinely hotter than a 40°C surface, and both are in the same climate context. Building density directly measures the urban fabric that traps heat. Let's see how each feature group separates the three UHI classes.
+
+================================================================================
+### CELL 7 (code)
+================================================================================
+# Key feature distributions by class
+fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+
+# Top row: spectral/thermal
+for ax, feat in zip(axes[0], ['LST', 'NDVI', 'elevation']):
+    if feat not in df.columns:
+        ax.axis('off'); continue
+    for cls in ['High', 'Medium', 'Low']:
+        vals = df[df['UHI_Class'] == cls][feat].dropna()
+        ax.hist(vals, bins=40, alpha=0.4, label=cls, density=True)
+    ax.set_title(feat)
+    ax.legend()
+
+# Bottom row: building features
+bldg_feats = [f for f in ['building_density_100m', 'bldg_mean_height', 'volume_density'] if f in df.columns]
+for ax, feat in zip(axes[1], bldg_feats + ['']*(3-len(bldg_feats))):
+    if not feat:
+        ax.axis('off'); continue
+    for cls in ['High', 'Medium', 'Low']:
+        vals = df[df['UHI_Class'] == cls][feat].dropna()
+        ax.hist(vals, bins=40, alpha=0.4, label=cls, density=True)
+    ax.set_title(feat)
+    ax.legend()
+
+plt.suptitle('Feature Distributions by UHI Class (Brazil)', y=1.02)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 8 (markdown)
+================================================================================
+**LST and NDVI** separate the classes cleanly with High UHI clusters around 48-51°C and low vegetation (NDVI <0.1), while Low sits at 35-42°C with more green cover (NDVI 0.1-0.3). **Building features are surprisingly weak** as building_density, mean_height, and volume_density all show nearly identical distributions across the three classes, meaning the urban morphology data from OSM isn't adding much discriminative power beyond what the spectral bands already capture.
+
+================================================================================
+### CELL 9 (code)
+================================================================================
+# Ordinal correlation with UHI class (Low=0, Medium=1, High=2)
+class_map = {'Low': 0, 'Medium': 1, 'High': 2}
+y_ord = df['UHI_Class'].map(class_map)
+
+corrs = df[FEATURES].corrwith(y_ord).sort_values(ascending=False)
+top_bottom = pd.concat([corrs.head(4), corrs.tail(4)])
+
+fig, ax = plt.subplots(figsize=(8, 4))
+colors = ['#d35400' if v > 0 else '#8e44ad' for v in top_bottom.values]
+top_bottom.plot(kind='barh', ax=ax, color=colors)
+ax.set_xlabel('Correlation with UHI Class (ordinal)')
+ax.set_title('Top 4 Heat-Associated (Orange) vs Top 4 Cooling-Associated (Purple) Features')
+ax.axvline(0, color='black', linewidth=0.5)
+ax.invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 10 (markdown)
+================================================================================
+The ordinal correlation reveals which features increase with UHI intensity (orange bars — thermal, built-up features) and which decrease (purple bars — vegetation, moisture). Features with |r| > 0.3 are strong UHI predictors within Brazil. Note that elevation's correlation here reflects genuine local topography (coastal plain vs hills), not a city-identifying artifact like it was in the cross-city analysis.
+
+================================================================================
+### CELL 11 (code)
+================================================================================
+# Correlation heatmap — lower triangle
+fig, ax = plt.subplots(figsize=(14, 10))
+corr = df[FEATURES].corr()
+mask = np.triu(np.ones_like(corr, dtype=bool))
+sns.heatmap(corr, mask=mask, cmap='RdBu_r', center=0, vmin=-1, vmax=1,
+            square=True, linewidths=0.3, annot_kws={'size': 6},
+            annot=len(FEATURES) <= 20, fmt='.1f', ax=ax)
+ax.set_title('Feature Correlation Matrix (Brazil)', fontsize=14)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 12 (markdown)
+================================================================================
+The correlation matrix shows which features carry redundant information. High inter-feature correlation (|r| > 0.85) means those features measure essentially the same thing — e.g., NDVI and SAVI are near-identical, NDBI and NDMI are perfect inverses. For tree-based models (RF, XGB) this redundancy is tolerable (they'll just split importance across correlated features), but it's worth noting for interpretability. The building features should show a different correlation structure from the spectral features — if they're largely independent, they're adding genuinely new information.
+
+================================================================================
+### CELL 13 (markdown)
+================================================================================
+---
+## 3. Engineered Features
+
+Within-city, we can create interaction terms that capture how features combine to produce UHI effects. For example, `LST × NDBI` captures the amplified heating effect in highly built-up areas — a hot dense urban zone generates more UHI than a hot but sparse area. These interactions would be meaningless in cross-city transfer (the absolute scales differ), but within Brazil they encode genuine physical relationships.
+
+================================================================================
+### CELL 14 (code)
+================================================================================
+# Interaction features
+if 'NDVI' in df.columns and 'LST' in df.columns:
+    df['LST_x_NDVI'] = df['LST'] * df['NDVI']
+    FEATURES.append('LST_x_NDVI')
+
+if 'NDBI' in df.columns and 'LST' in df.columns:
+    df['LST_x_NDBI'] = df['LST'] * df['NDBI']
+    FEATURES.append('LST_x_NDBI')
+
+if 'elevation' in df.columns and 'LST' in df.columns:
+    df['elev_x_LST'] = df['elevation'] * df['LST']
+    FEATURES.append('elev_x_LST')
+
+if 'NDVI' in df.columns and 'NDBI' in df.columns:
+    df['NDVI_minus_NDBI'] = df['NDVI'] - df['NDBI']
+    FEATURES.append('NDVI_minus_NDBI')
+
+if 'building_density_100m' in df.columns and 'LST' in df.columns:
+    df['bldg_density_x_LST'] = df['building_density_100m'] * df['LST']
+    FEATURES.append('bldg_density_x_LST')
+
+print(f'Total features after engineering: {len(FEATURES)}')
+for f in FEATURES:
+    print(f'  {f}')
+
+================================================================================
+### CELL 15 (markdown)
+================================================================================
+---
+## 4. Model Comparison — 5-Fold Stratified CV
+
+We compare RF and XGB with the full feature set and QT preprocessing. Both models are tree-based and handle the correlated feature set well. We track per-class F1 alongside weighted F1 and the train-test gap — a large gap means the model is memorizing training patterns rather than learning generalizable rules, even within the same city.
+
+================================================================================
+### CELL 16 (code)
+================================================================================
+le = LabelEncoder()
+le.fit(['High', 'Low', 'Medium'])
+
+x = df[FEATURES].values
+y = le.transform(df['UHI_Class'])
+
+# QT normalize
+qt = QuantileTransformer(n_quantiles=min(1000, len(x)),
+                         output_distribution='uniform', random_state=42)
+x = qt.fit_transform(x)
+
+# Compute class weights for XGB (it doesn't have class_weight='balanced')
+from sklearn.utils.class_weight import compute_sample_weight
+
+models = {
+    'RF': RandomForestClassifier(
+        n_estimators=300, max_depth=15, min_samples_leaf=5,
+        class_weight='balanced', random_state=42, n_jobs=-1),
+    'XGB': XGBClassifier(
+        n_estimators=300, max_depth=8, learning_rate=0.1,
+        random_state=42, n_jobs=-1, eval_metric='mlogloss', verbosity=0),
+}
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+results = []
+fold_details = {name: [] for name in models}
+
+print(f'{"Model":<6} {"Fold":<6} {"Train F1":>10} {"Test F1":>10} {"Gap":>8} {"High":>8} {"Med":>8} {"Low":>8}')
+print('-' * 70)
+
+for name, model in models.items():
+    for fold, (tr_idx, te_idx) in enumerate(skf.split(x, y)):
+        x_tr, x_te = x[tr_idx], x[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        # XGB needs sample_weight for class balancing
+        if name == 'XGB':
+            sw = compute_sample_weight('balanced', y_tr)
+            model.fit(x_tr, y_tr, sample_weight=sw)
+        else:
+            model.fit(x_tr, y_tr)
+
+        f1_tr = f1_score(y_tr, model.predict(x_tr), average='weighted')
+        y_pred = model.predict(x_te)
+        f1_te = f1_score(y_te, y_pred, average='weighted')
+
+        per_class = {}
+        for cls_name in ['High', 'Medium', 'Low']:
+            cls_idx = le.transform([cls_name])[0]
+            mask_te = (y_te == cls_idx)
+            mask_pred = (y_pred == cls_idx)
+            tp = (mask_te & mask_pred).sum()
+            prec = tp / max(mask_pred.sum(), 1)
+            rec = tp / max(mask_te.sum(), 1)
+            per_class[cls_name] = 2 * prec * rec / max(prec + rec, 1e-9)
+
+        print(f'{name:<6} {fold:<6} {f1_tr:>10.3f} {f1_te:>10.3f} {f1_tr-f1_te:>8.3f} '
+              f'{per_class["High"]:>8.3f} {per_class["Medium"]:>8.3f} {per_class["Low"]:>8.3f}')
+
+        results.append({'model': name, 'fold': fold, 'f1_train': f1_tr,
+                        'f1_test': f1_te, 'gap': f1_tr - f1_te, **per_class})
+        fold_details[name].append({'y_true': y_te, 'y_pred': y_pred})
+
+df_results = pd.DataFrame(results)
+
+================================================================================
+### CELL 17 (code)
+================================================================================
+# Summary
+print('\n=== MEAN ACROSS 5 FOLDS ===')
+summary = df_results.groupby('model').agg({
+    'f1_train': 'mean', 'f1_test': 'mean', 'gap': 'mean',
+    'High': 'mean', 'Medium': 'mean', 'Low': 'mean'
+}).round(3)
+print(summary.to_string())
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+summary[['f1_test']].plot(kind='bar', ax=axes[0], color='steelblue', legend=False)
+axes[0].set_title('Mean Test F1 by Model')
+axes[0].set_ylabel('Weighted F1')
+axes[0].set_ylim(0, 1)
+plt.setp(axes[0].get_xticklabels(), rotation=0)
+
+summary[['High', 'Medium', 'Low']].plot(kind='bar', ax=axes[1])
+axes[1].set_title('Per-Class F1 by Model')
+axes[1].set_ylabel('F1')
+axes[1].set_ylim(0, 1)
+axes[1].legend(title='Class')
+plt.setp(axes[1].get_xticklabels(), rotation=0)
+
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 18 (markdown)
+================================================================================
+The summary table shows the average performance across all 5 folds. Key things to look for: (1) which model wins overall, (2) whether Medium is still the bottleneck class like it was in cross-city transfer, and (3) the train-test gap — if it's small (<0.05), the model is generalizing well within Brazil; if it's large (>0.15), we're overfitting and should reduce model complexity or feature count.
+
+================================================================================
+### CELL 19 (markdown)
+================================================================================
+---
+## 5. Best Model — Confusion Matrix & Classification Report
+
+The confusion matrix reveals the error patterns. In the cross-city pipeline, Medium was consistently confused with both High and Low. Within Brazil, we expect tighter class boundaries since the model has access to building features and elevation that directly measure the physical drivers of UHI.
+
+================================================================================
+### CELL 20 (code)
+================================================================================
+best_model_name = summary['f1_test'].idxmax()
+print(f'Best model: {best_model_name} (mean F1={summary.loc[best_model_name, "f1_test"]:.3f})')
+
+all_true = np.concatenate([fd['y_true'] for fd in fold_details[best_model_name]])
+all_pred = np.concatenate([fd['y_pred'] for fd in fold_details[best_model_name]])
+
+print(f'\n{classification_report(all_true, all_pred, target_names=le.classes_, digits=3)}')
+
+cm = confusion_matrix(all_true, all_pred)
+fig, ax = plt.subplots(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+            xticklabels=le.classes_, yticklabels=le.classes_,
+            linewidths=0.5, square=True)
+ax.set_xlabel('Predicted')
+ax.set_ylabel('Actual')
+ax.set_title(f'{best_model_name} — Confusion Matrix (all 5 folds)')
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 21 (markdown)
+================================================================================
+---
+## 6. Feature Importance
+
+Feature importance from the best model trained on all data. This tells us which features the model relies on most for splitting decisions. We expect thermal features (LST, lwir11) to dominate, but the question is: how much do building features and interaction terms contribute? If building density or mean height appears in the top 10, it means those urban morphology features carry UHI signal that the spectral bands alone miss.
+
+================================================================================
+### CELL 22 (code)
+================================================================================
+best_model = models[best_model_name]
+sw_full = compute_sample_weight('balanced', y)
+if best_model_name == 'XGB':
+    best_model.fit(x, y, sample_weight=sw_full)
+else:
+    best_model.fit(x, y)
+
+imp = best_model.feature_importances_
+feat_imp = pd.Series(imp, index=FEATURES).sort_values(ascending=False)
+
+# Plot only top 10
+top10_imp = feat_imp.head(10).sort_values(ascending=True)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+top10_imp.plot(kind='barh', ax=ax, color='steelblue')
+ax.set_xlabel('Importance')
+ax.set_title(f'{best_model_name} Top 10 Feature Importance (full data)')
+plt.tight_layout()
+plt.show()
+
+# print('Top 15 features:')
+# for feat, imp_val in feat_imp.head(15).items():
+#     print(f'  {feat:<30} {imp_val:.4f}')
+
+================================================================================
+### CELL 23 (markdown)
+================================================================================
+---
+## 7. Feature Ablation — Does the Full Feature Set Actually Help?
+
+This is the key experiment. We compare three feature sets: (1) the same 5 spectral bands used in cross-city transfer, (2) spectral + all indices, and (3) the full set including building features and interactions. If the full set significantly beats spectral-only, it confirms that within-city modeling benefits from features that were harmful in cross-city settings. If the gap is small, the spectral bands carry most of the signal regardless of context.
+
+================================================================================
+### CELL 24 (code)
+================================================================================
+feature_sets = {
+    'Spectral only (5)': [f for f in SPECTRAL if f in df.columns],
+    'Spectral + Indices': [f for f in SPECTRAL + INDICES if f in df.columns],
+    'Full': FEATURES,
+}
+
+ablation = []
+for fs_name, feats in feature_sets.items():
+    x_raw = df[feats].fillna(0).values
+    qt_fs = QuantileTransformer(n_quantiles=min(1000, len(x_raw)),
+                                 output_distribution='uniform', random_state=42)
+    x_fs = qt_fs.fit_transform(x_raw)
+    y_fs = le.transform(df['UHI_Class'])
+
+    fold_f1s = []
+    for tr_idx, te_idx in skf.split(x_fs, y_fs):
+        rf = RandomForestClassifier(n_estimators=300, max_depth=15, min_samples_leaf=5,
+                                     class_weight='balanced', random_state=42, n_jobs=-1)
+        rf.fit(x_fs[tr_idx], y_fs[tr_idx])
+        f1 = f1_score(y_fs[te_idx], rf.predict(x_fs[te_idx]), average='weighted')
+        fold_f1s.append(f1)
+
+    mean_f1 = np.mean(fold_f1s)
+    ablation.append({'features': fs_name, 'n_features': len(feats), 'mean_f1': mean_f1,
+                     'std_f1': np.std(fold_f1s)})
+    print(f'{fs_name:<25} ({len(feats):>2} feats)  F1={mean_f1:.3f} +/- {np.std(fold_f1s):.3f}')
+
+df_ablation = pd.DataFrame(ablation)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.barh(df_ablation['features'], df_ablation['mean_f1'], color='steelblue',
+        xerr=df_ablation['std_f1'], capsize=4)
+ax.set_xlabel('Mean F1 (5-fold CV)')
+ax.set_title('Feature Set Ablation')
+ax.set_xlim(0, 1)
+plt.tight_layout()
+plt.show()
+
+================================================================================
+### CELL 25 (markdown)
+================================================================================
+The ablation results quantify exactly how much each feature group contributes within-city. If the full set beats spectral-only by more than 0.05 F1, the building/index features are carrying meaningful UHI signal that isn't captured by the 5 spectral bands alone. This directly contrasts with the cross-city finding where more features always hurt — confirming that the "5 bands only" rule is specific to domain transfer, not a universal property of UHI classification.
+
+================================================================================
+### CELL 26 (markdown)
+================================================================================
+---
+## 8. Train Final Model & Save
+
+================================================================================
+### CELL 27 (code)
+================================================================================
+# Train final model on all Brazil data
+final_model = models[best_model_name]
+sw_full = compute_sample_weight('balanced', y)
+if best_model_name == 'XGB':
+    final_model.fit(x, y, sample_weight=sw_full)
+else:
+    final_model.fit(x, y)
+
+y_pred_full = final_model.predict(x)
+f1_full = f1_score(y, y_pred_full, average='weighted')
+print(f'Full-data refit F1: {f1_full:.3f} (sanity check)')
+print(f'\n{classification_report(y, y_pred_full, target_names=le.classes_, digits=3)}')
+
+================================================================================
+### CELL 28 (code)
+================================================================================
+# Save predictions
+df_out = df[['Longitude', 'Latitude', 'UHI_Class']].copy()
+df_out['predicted'] = le.inverse_transform(y_pred_full)
+df_out['correct'] = df_out['UHI_Class'] == df_out['predicted']
+print(f'Accuracy: {df_out["correct"].mean():.3f}')
+print(f'\nMisclassified by class:')
+wrong = df_out[~df_out['correct']]
+print(wrong['UHI_Class'].value_counts().to_string())
+
+================================================================================
+### CELL 29 (markdown)
+================================================================================
+---
+## Summary
+
+**Setup**: Brazil-only within-city classification. 5-fold stratified CV. RF and XGB compared. Full feature set including building morphology, spectral indices, elevation, and interaction terms.
+
+**Key difference from cross-city**: In the SL pipeline, we restricted to 5 spectral bands because indices were redundant and building/spatial features leaked city identity. Here, those constraints don't apply — building density, coverage ratio, mean height, and volume density directly measure the urban fabric that causes heat islands. Elevation captures local topographic cooling/trapping effects.
+
+**What to look for in the results**: (1) Overall F1 should be significantly higher than cross-city (~0.55) since there's no domain gap. (2) The feature ablation tells us how much building features help — if the gap between spectral-only and full is large, it validates that urban morphology carries UHI signal beyond what satellites alone capture. (3) Medium class performance — if it's still the bottleneck even within-city, the class boundary is intrinsically hard; if it improves significantly, the cross-city Medium problem was a domain adaptation issue, not a fundamental classification challenge.
