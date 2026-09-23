@@ -84,5 +84,12 @@ def load_sweep(resolution_m: int) -> pd.DataFrame:
     )
 
 
+def _show(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 def describe() -> str:
-    return f"environment={ENVIRONMENT}  raw={RAW_DIR}  out={OUT_DIR}"
+    return f"environment={ENVIRONMENT}  raw={_show(RAW_DIR)}  out={_show(OUT_DIR)}"

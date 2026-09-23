@@ -1,118 +1,146 @@
-# Predicting Urban Heat Islands — A Machine Learning Approach Across Three Cities
+# Predicting Urban Heat Islands from Satellite Data: Rio, Santiago, Freetown
 
-Satellite-driven classification of Urban Heat Island (UHI) intensity in Rio de
-Janeiro and Santiago, with a combined model transferred to predict UHI risk in
-Freetown, Sierra Leone.
+Classifying urban heat island (UHI) intensity (Low / Medium / High) at 100 m
+from Sentinel-2, Landsat-8 and elevation data. The models are trained on Rio de
+Janeiro and Santiago, then transferred to Freetown, Sierra Leone, a city with
+**no labels of its own**.
 
-**Team project** — Hult International Business School, Business Challenge II.
-Team: Carolina Trovisco, Filippo Beni, João Ponte, Mickias Ambaye,
-**Youness Yachruti**, Yousra Sajjad. My focus on this team was model
-research: testing and tuning multiple tree-based and gradient-boosting models
-across all three locations to improve prediction accuracy. See a teammate's
-complementary extraction-pipeline repo:
-[Mickias-Ambaye/uhi-pipe](https://github.com/Mickias-Ambaye/uhi-pipe).
+![UHI class at every sample point](reports/figures/uhi_maps.png)
 
-## Overview
+| City | Task | Model | Weighted F1 | How it was measured |
+|---|---|---|---:|---|
+| Rio de Janeiro | within-city | XGBoost (class-balanced) | **0.959** | 5-fold stratified CV |
+| Santiago | within-city | Quantile-transformed Random Forest | **0.690** | 20% stratified hold-out |
+| Freetown | cross-city transfer | Per-class RF + XGBoost specialists | **0.58** | challenge leaderboard (hidden labels) |
 
-Urban Heat Islands are urban areas that run warmer than their surroundings —
-sometimes by 10°C+ locally — driven by dense building layouts, impervious
-surface heat absorption, and waste heat from industry and transport. The
-challenge: build a model that predicts UHI intensity from satellite data
-alone, and test whether a model trained on two cities can transfer to predict
-a third city it has never seen.
+Every Rio and Santiago figure above reproduces from this repo in about 4 minutes
+(see [How to run](#how-to-run)).
 
-We extracted Sentinel-2 spectral indices and Landsat-8 thermal/elevation data
-for Rio de Janeiro and Santiago (50,150 combined data points), engineered
-interaction features (e.g. LST × NDVI, elevation × LST), trained per-city
-classifiers, then tested whether a model combining both cities' signal could
-predict UHI intensity in Freetown, Sierra Leone — a city with no training
-labels of its own.
+---
 
-## Key results
+## My role
 
-All figures below are held-out classification performance (F1 / precision /
-recall), taken directly from the team's final report — not backtested or
-live figures, this is a classification task, not a trading strategy.
+Team project for Hult International Business School, Business Challenge II (Team 4).
 
-- **Rio de Janeiro:** F1 = 0.959 (Precision 0.960, Recall 0.959) — best model:
-  XGBoost. Rio's heat signal is dominated by raw thermal response and building
-  morphology; intense year-round solar exposure combined with high shares of
-  concrete/asphalt makes UHI comparatively easy to detect.
-- **Santiago:** F1 = 0.690 (Precision 0.694, Recall 0.690) — best model:
-  Random Forest. Santiago's heat pattern is structurally harder to model —
-  shaped by elevation, slope, and built form (Andes Mountains / Chilean Coast
-  Range), which makes hotspot boundaries less clean.
-- **Freetown (combined Chile+Brazil → Sierra Leone transfer):** F1 = 0.58
-  (Precision 0.59, Recall 0.58) — best model: ensemble of XGBoost and Random
-  Forest. Transferability is limited by raw features encoding location
-  identity rather than heat patterns; separate models per UHI class (High/
-  Medium/Low) were needed since the classes weren't cleanly separable
-  end-to-end.
+- **Me (Youness Yachruti): the machine-learning modelling.** I ran the model search
+  and selection for Rio and Santiago (testing model families, resolutions and
+  tuning, and picking the best fit for each city from the results) and built
+  the transfer model that predicts Freetown.
+- **Mickias Ambaye: satellite extraction.** His [`uhi_pipe`](https://github.com/Mickias-Ambaye/uhi-pipe)
+  package is vendored in [`uhi_pipe/`](uhi_pipe/CREDITS.md) with his permission,
+  and his commits are preserved in this history. He also wrote
+  `notebooks/01_data_extraction.ipynb`.
+- **Team:** Carolina Trovisco, Filippo Beni, João Ponte, Mickias Ambaye,
+  Youness Yachruti, Yousra Sajjad. The written report is in
+  [`reports/`](reports/Urban%20Heat%20Indicator%20-%20Team%204%20-%20BC2.pdf).
 
-**Cross-city takeaway:** urban heat drivers are city-specific, not universal
-— Rio's heat is legible through building materials and solar exposure,
-Santiago's through terrain, and Freetown's classification is complicated by
-roofing material and color effects not fully captured by the transferred
-model.
+## Architecture
+
+```
+ Microsoft Planetary Computer            Microsoft Fabric (Python notebooks)
+ Sentinel-2 · Landsat-8 · DEM ──► uhi_pipe ──► Lakehouse Files ──► models ──► predictions
+ 3D-GloBFP building footprints    (extract)    dataset_100m_*.csv   02_uhi_    freetown_
+                                               buildings_*.csv      classif.   predictions.csv
+                                                     │
+                                         mirrored in data/raw/ so the same
+                                         notebooks also run on any laptop
+```
+
+- **Cloud:** the project ran in Microsoft Fabric notebooks, reading from and
+  writing to the Lakehouse Files area. [`uhi_models/config.py`](uhi_models/config.py)
+  detects the Lakehouse and uses its paths. Anywhere else it uses `data/`, so
+  nothing is hard-coded.
+- **Memory and storage:** scenes load lazily in 2048 × 2048-pixel chunks as
+  `uint16`, and each raster is released once it has been sampled at the points.
+  No images are written to disk, and intermediate results are cached as Parquet
+  so re-runs skip completed downloads. Details are in [`data/README.md`](data/README.md).
 
 ## Approach
 
-1. **Data extraction** (`UHI_Data_Extraction.ipynb`) — Sentinel-2 L2A and
-   Landsat-8 imagery pulled per location via the Microsoft Planetary
-   Computer STAC API; ~50% cloud coverage in one scene was handled with SCL
-   (Scene Classification Layer) filtering and median compositing across
-   multiple scenes.
-2. **Feature engineering** — 25 Sentinel-2 spectral indices (vegetation,
-   water, built-up, and surface categories), Landsat land-surface temperature
-   + elevation, and 6 engineered interaction features (e.g. LST × NDVI).
-3. **Per-city modeling** (`notebooks/Brazil.ipynb`, `notebooks/Chile.ipynb`)
-   — city-specific classifiers tested across tree-based and gradient-boosting
-   model families (Random Forest, XGBoost), tuned separately per city.
-4. **Cross-city transfer** (`notebooks/Combined.ipynb`,
-   `notebooks/SL_Class_based_Pipeline_V2.ipynb`) — combined Chile+Brazil
-   training set, with Quantile Transformation + PCA used to isolate
-   UHI-relevant signal from city-specific characteristics before predicting
-   Freetown.
-5. **Reporting** (`UHI Classification.ipynb`) — consolidated written summary:
-   contributing factors, mitigation strategy, and additional-data
-   recommendations.
+**1. Rio: the heat signal is strong, so tune for it.** A class-balanced
+XGBoost beat Random Forest in 5-fold CV (0.959 vs 0.947). Thermal bands
+dominate (`lwir11`, then moisture `NDMI` and `LST`), followed by building
+compactness. The ablation shows how far thermal data alone gets you: 5
+spectral bands already score 0.934, and indices plus building morphology add
+the last 1.3 points.
 
-`notebooks/landsat_lst.ipynb` is a standalone utility for generating an
-interactive Folium land-surface-temperature map. `src/app.py` is a Streamlit
-dashboard built on top of the feature-extraction modules
-(`src/get_geo_features.py`, `src/get_satellite_features.py`).
+<p float="left">
+  <img src="reports/figures/rio_feature_importance.png" width="49%" />
+  <img src="reports/figures/rio_feature_ablation.png" width="49%" />
+</p>
 
-## Stack
+**2. Santiago: terrain, not materials.** Half of Santiago's labels are
+"Medium", and they overlap both extremes, which makes this city far harder than
+Rio. Elevation and the elevation × LST interaction are the top two features,
+because the Andean basin creates thermal gradients that surface materials don't
+explain. A depth-constrained Random Forest on quantile-transformed features
+handled the ambiguous Medium class better than boosting did.
 
-Python: pandas, numpy, scikit-learn, xgboost, shap, xarray, rioxarray,
-rasterio, rasterstats, geopandas, pystac-client, planetary-computer,
-odc-stac, streamlit, folium, matplotlib, seaborn
+<img src="reports/figures/santiago_feature_importance.png" width="60%" />
+
+**3. Freetown: the transfer problem.** Raw temperatures don't carry across
+cities. Santiago's "High" sits at about the same land-surface temperature as
+Rio's "Low".
+
+![Land-surface temperature by class and city](reports/figures/cross_city_lst_shift.png)
+
+Leave-one-city-out tests confirmed it: a model trained on Rio scores F1 0.36 on
+Santiago, and Santiago → Rio scores 0.47. So the transfer model:
+
+1. Uses five thermal and spectral features (`lwir11`, `LST`, `SWIR2_NIR`,
+   `blue`, `nir08`) and **quantile-transforms** them separately for the
+   training city and for Freetown. Each side is ranked against itself, so
+   "hot for Freetown" lines up with "hot for Rio" even though the absolute
+   temperatures differ.
+2. Compresses them to **3 principal components** fitted on the training
+   city. On Rio and Santiago combined, 3 components keep 96% of the variance.
+3. Trains a **one-vs-rest specialist per class** on the source that matches
+   Freetown best for that class: *High* from Rio's dense tropical core,
+   *Medium* from Santiago's mixed fringe, *Low* from both cities.
+4. Averages the Random Forest and XGBoost specialist scores.
+
+This scored **0.58** on the challenge leaderboard. With no local labels, the
+notebook can only check its predictions against KMeans pseudo-labels (0.518),
+and that number measures agreement with spectral clusters, not accuracy.
+
+## Repository layout
+
+```
+├── data/
+│   ├── raw/            model inputs: 5 tables, 3 cities (data card: data/README.md)
+│   └── processed/      predictions for Rio, Santiago, Freetown
+├── notebooks/
+│   ├── 01_data_extraction.ipynb      satellite → data/raw (needs network)
+│   ├── 02_uhi_classification.ipynb   the full modelling pipeline ✅ reproducible
+│   └── research/                     Fabric model-search log (see notebooks/README.md)
+├── uhi_models/         data access and Fabric/local path detection
+├── uhi_pipe/           satellite extraction package (Mickias Ambaye)
+└── reports/            figures, make_figures.py, team report (PDF)
+```
 
 ## How to run
 
 ```bash
 git clone https://github.com/youness-yach/uhi-business-challenge.git
 cd uhi-business-challenge
-pip install pandas numpy scipy scikit-learn xgboost shap xarray rioxarray \
-  rasterio rasterstats geopandas pystac-client planetary-computer odc-stac \
-  streamlit folium matplotlib seaborn
+pip install -e .                         # add ".[extract]" to re-pull satellite data
+jupyter nbconvert --to notebook --execute --inplace notebooks/02_uhi_classification.ipynb
+python reports/make_figures.py           # rebuilds reports/figures/
 ```
 
-Run `UHI_Data_Extraction.ipynb` first to pull satellite features for each
-location, then the per-city notebooks (`notebooks/Brazil.ipynb`,
-`notebooks/Chile.ipynb`), then `notebooks/Combined.ipynb` /
-`notebooks/SL_Class_based_Pipeline_V2.ipynb` for the cross-city transfer.
-`UHI Classification.ipynb` consolidates the written findings.
+On Microsoft Fabric, upload `data/raw/*.csv` to the Lakehouse Files area,
+`%pip install` this repo in the notebook session, and run the same notebook.
 
-## Notes / limitations
+## Limitations
 
-- Freetown had no ground-truth UHI labels for training — the combined-city
-  model's 0.58 F1 there reflects transfer performance, not in-city validation.
-- Cloud contamination and single-composite satellite snapshots limit temporal
-  resolution; the team's report recommends hourly/seasonal time-series data
-  and higher-resolution building morphology as natural next steps.
-- Full findings, methodology detail, and the team's mitigation recommendations
-  are in `Urban Heat Indicator - Team 4 - BC2.pdf`.
+- Freetown has no ground truth. Its 0.58 comes from the leaderboard's hidden
+  labels, so the error can't be broken down by class.
+- Each city is a single satellite composite, one date window. Seasonal and
+  hourly data would be the natural next step, along with higher-resolution
+  building morphology (see the team report).
+- Heat drivers turned out to be city-specific: materials and sun in Rio,
+  terrain in Santiago. One universal model would lose to per-city models,
+  which is why the transfer relies on class specialists.
 
 ---
 Youness Yachruti · [LinkedIn](https://www.linkedin.com/in/youness-yachruti/)
