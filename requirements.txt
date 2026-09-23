@@ -1,4 +1,5 @@
-# Python dependencies
-pandas
-numpy
-matplotlib
+# Install everything needed to run the notebooks from the committed data:
+#   pip install -e .
+# Add satellite re-extraction dependencies (uhi_pipe / notebook 01):
+#   pip install -e ".[extract]"
+-e .

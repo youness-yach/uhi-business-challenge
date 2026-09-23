@@ -20,9 +20,33 @@ data/
    sampled at each point on a 100 m grid. The team's extraction package is
    [Mickias-Ambaye/uhi-pipe](https://github.com/Mickias-Ambaye/uhi-pipe);
    `notebooks/01_data_extraction.ipynb` is the version run for this project.
-3. **Building morphology.** Building footprints (height, area, volume) were
-   aggregated in a 100 m buffer around each point. The raw footprint
-   shapefiles (~380 MB) are not committed. Only the aggregated columns are.
+3. **Building morphology.** 3D building footprints from 3D-GloBFP
+   ([Li et al., 2024](https://doi.org/10.5281/zenodo.11319912)) were aggregated
+   in a 100 m buffer around each point (height, area, volume, coverage). The
+   footprint tiles (~380 MB) are not committed. Only the aggregated columns are.
+
+## Where this ran: Microsoft Fabric
+
+The team worked in Microsoft Fabric notebooks (Python). Inputs and outputs lived
+in the Files area of the attached Lakehouse:
+
+```
+/lakehouse/default/Files/
+├── dataset_100m_<city>.csv, buildings_<city>.csv   ← same tables as data/raw/
+└── uhi_pipe_output/
+    ├── datasets/ML_Dataset_<res>m.csv              ← resolution sweep (10 m – 1000 m)
+    └── predictions/                                ← model outputs
+```
+
+`uhi_models/config.py` detects the Lakehouse and uses these paths. Anywhere
+else it uses `data/`, so the notebooks run unchanged in both places.
+
+The extraction step was built to fit notebook memory:
+- Scenes load lazily in 2048 × 2048-pixel chunks (`odc-stac`) with `uint16` bands.
+- Each raster is released (`del`) as soon as it has been sampled at the points.
+- Elevation is cast to `float32`, and downloads stream in 8 KB pieces.
+- `uhi_pipe` samples values at the points without writing images to disk, and
+  caches each source as Parquet, so re-runs skip completed downloads.
 
 ## raw/
 
@@ -75,9 +99,16 @@ Index formulas follow the definitions documented in
 
 | File | Rows | What it is |
 |---|---:|---|
-| `rio_predictions_in_sample.csv` | 28,488 | Final Rio model's predictions on its **own training points** (`predicted`, `correct`). The 99.7% hit rate here is in-sample. The held-out F1 of 0.959 in the README is the real performance figure. |
-| `santiago_predictions.csv` | 21,662 | Final Santiago model's predicted class per point. |
-| `freetown_predictions.csv` | 14,105 | Combined Rio + Santiago model transferred to Freetown: the challenge submission. |
+| `rio_predictions_in_sample.csv` | 28,488 | Final Rio XGBoost's predictions on its **own training points** (`predicted`, `correct`). The 99.7% hit rate is in-sample. The 5-fold cross-validated F1 of 0.959 is the real performance figure. Written by `notebooks/02_uhi_classification.ipynb`. |
+| `santiago_predictions.csv` | 21,662 | Santiago model's predicted class per point, exported during the challenge. |
+| `freetown_predictions.csv` | 14,105 | Freetown transfer: class specialists trained on Rio and Santiago, RF + XGBoost ensemble. This is the challenge submission, written by `notebooks/02_uhi_classification.ipynb`. A fresh run reproduces it row for row. |
+
+## sweep/ (not committed)
+
+The research notebooks compare extraction resolutions and read
+`ML_Dataset_<res>m.csv`. The 100 m table is rebuilt on the fly from `raw/`.
+250 m and 500 m tables have to be re-extracted with `uhi_pipe` (see
+`uhi_models.config.load_sweep`).
 
 ## Licence and use
 
